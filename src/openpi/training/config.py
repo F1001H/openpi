@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.kobo_policy as kobo_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -65,6 +66,8 @@ class AssetsConfig:
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
+    # LeRobot dataset root. If None, remote repo will be called using repo_id
+    root: pathlib.Path | None = None
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -167,6 +170,8 @@ class ModelTransformFactory(GroupFactory):
 class DataConfigFactory(abc.ABC):
     # The LeRobot repo id.
     repo_id: str = tyro.MISSING
+
+    root: pathlib.Path | str | None = None    
     # Determines how the assets will be loaded.
     assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
     # Base config that will be updated by the factory.
@@ -178,16 +183,39 @@ class DataConfigFactory(abc.ABC):
 
     def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
+        root_path = self.root if self.root is not tyro.MISSING else None
         asset_id = self.assets.asset_id or repo_id
         return dataclasses.replace(
             self.base_config or DataConfig(),
             repo_id=repo_id,
             asset_id=asset_id,
+            root=root_path,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
         )
 
     def _load_norm_stats(self, assets_dir: epath.Path, asset_id: str | None) -> dict[str, _transforms.NormStats] | None:
+        # If a strict local root is given, try loading stats directly from the root directory
+        if self.root and self.root is not tyro.MISSING:
+            local_stats_path = epath.Path(self.root) / "meta" / "stats.json"  # Using your verified path
+            if local_stats_path.exists():
+                logging.info(f"Loading local Kobo norm stats from {local_stats_path}")
+                
+                # Read the raw JSON text safely
+                import json
+                raw_data = json.loads(local_stats_path.read_text())
+                
+                # Check if it's raw LeRobot style (missing the top-level norm_stats key)
+                if "norm_stats" not in raw_data:
+                    logging.info("Adapting LeRobot stats layout to OpenPI schema format...")
+                    raw_data = {"norm_stats": raw_data}
+                
+                # Use OpenPI's internal deserializer hook with the modified layout dict
+                return _normalize.deserialize_json(json.dumps(raw_data))
+            else:
+                logging.warning(f"Expected local stats at {local_stats_path} but it was not found.")
+
+        # Legacy cloud/fallback loader paths
         if asset_id is None:
             return None
         try:
@@ -223,6 +251,69 @@ class SimpleDataConfig(DataConfigFactory):
             data_transforms=self.data_transforms(model_config),
             model_transforms=self.model_transforms(model_config),
         )
+    
+
+@dataclasses.dataclass(frozen=True)
+class KoboDataConfig(DataConfigFactory):
+    """
+    Data configuration for the Kobo local/bimanual_cube dataset format (LeRobot v3 style).
+    Maps singular 'action' and namespaced observations directly into OpenPI internal spaces.
+    """
+    # Default instruction string injected if prompt is not present in the runtime engine
+    default_prompt: str | None = "pick up the cube and place it on the red tape"
+    
+    # If your dataset's actions are absolute target poses (e.g., your kinematic absolute pose vectors),
+    # setting this to True converts the first 6 spatial dim parameters to deltas relative to the starting 
+    # frame block, while keeping the 7th dimension (gripper state) absolute.
+    use_delta_actions: bool = True
+
+    # Action sequence tracking keys needed by the baseline trainer configuration
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # 1. Repack Transform: Maps your modern local info.json strings straight to 
+        # the normalized internal labels that the model policy uses.
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "image": "observation.images.cam1",       # Modern v3 singular image key
+                        "state": "observation.state",             # Modern namespaced state
+                        "actions": "action",                      # Maps dataset singular 'action' to model 'actions'
+                    }
+                )
+            ]
+        )
+
+        # 2. Data Transforms: Configure policy processing parameters. 
+        # You can substitute 'aloha_policy' or a fallback here depending on your asset configurations.
+        data_transforms = _transforms.Group(
+            inputs=[kobo_policy.KoboInputs(model_type=model_config.model_type)],
+            outputs=[kobo_policy.KoboOutputs()],
+        )
+
+        # 3. Handle Absolute to Delta action conversions if selected for Pi0 policy consistency
+        if self.use_delta_actions:
+            # Mask first 6 tracking variables (xyz, quat rotations) as deltas, leave the 7th intact
+            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        # 4. Model Transforms: Automatically creates baseline tokenization frameworks for prompts
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        # Assemble and pass complete DataConfig asset mapping back to the model constructor
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
 
 
 @dataclasses.dataclass(frozen=True)
@@ -506,7 +597,7 @@ class TrainConfig:
     batch_size: int = 32
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
     # will increase memory and CPU usage.
-    num_workers: int = 2
+    num_workers: int = 8
     # Number of train steps (batches) to run.
     num_train_steps: int = 30_000
 
@@ -964,6 +1055,89 @@ _CONFIGS = [
         overwrite=True,
         exp_name="debug_pi05",
         wandb_enabled=False,
+    ),
+
+    #
+    # Kobo Task-Space Cube Manipulation configs (LeRobot v3 Native Layout).
+    #
+    TrainConfig(
+        name="pi0_kobo_cube",
+        # Full fine-tuning utilizing the base Pi0 model architecture setup
+        model=pi0_config.Pi0Config(
+            action_dim=7,          # Matching your task-space vector dimension (3D translation + 4D quaternion)
+            action_horizon=10,     # The number of forward rollout target steps per model prediction chunk
+        ),
+        data=KoboDataConfig(
+            repo_id="local/bimanual_cube",
+            use_delta_actions=True, # Transforms workspace spatial positions into relative displacement vectors
+            base_config=DataConfig(
+                prompt_from_task=True,
+                root=pathlib.Path("/home/fabian/lev3_dataset_cube_task_space"),  # Native dataset v3 target path
+            ),
+        ),
+        # Initialize weights from the standardized upstream base parameters
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+        batch_size=32,
+    ),
+    TrainConfig(
+        name="pi0_kobo_cube_low_mem",
+        model=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            pi05=True,
+            discrete_state_input=False,
+            action_horizon=10
+        ),
+        data=KoboDataConfig(
+            repo_id="local/bimanual_cube",
+            use_delta_actions=False,
+            root=pathlib.Path("/home/fabian/lev3_dataset_cube_task_space"),
+            # Add the literal text string directly here!
+            default_prompt="pick up the cube and place it on the red tape",
+            base_config=DataConfig(
+                # Change this to False so OpenPI relies on your clean string 
+                # instead of attempting the broken index lookup math
+                prompt_from_task=False,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            pi05=True,
+            discrete_state_input=False,
+            action_horizon=10        
+        ).get_freeze_filter(),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        ema_decay=None,
+        num_train_steps=30_000,
+        batch_size=32,
+    ),
+    TrainConfig(
+        name="pi0_fast_kobo_cube",
+        # Configured alternative targeting high-frequency, low-latency deployment runtimes
+        model=pi0_fast.Pi0FASTConfig(
+            action_dim=7,
+            action_horizon=12,     # Slightly expanded trajectory execution chunk
+            max_token_len=180,     # Optimized single-arm/simple multi-arm frame length matrix bounds
+        ),
+        data=KoboDataConfig(
+            repo_id="local/bimanual_cube",
+            use_delta_actions=True,
+            base_config=DataConfig(
+                prompt_from_task=True,
+                root=pathlib.Path("/home/fabian/lev3_dataset_cube_task_space"),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+        num_train_steps=30_000,
+        batch_size=32,
     ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),

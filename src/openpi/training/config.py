@@ -278,8 +278,9 @@ class KoboDataConfig(DataConfigFactory):
             inputs=[
                 _transforms.RepackTransform(
                     {
-                        "image": "observation.images.cam1",       # Modern v3 singular image key
-                        "state": "observation.state",             # Modern namespaced state
+                        "observation/image": "observation.images.cam1",
+                        "observation/external_image": "observation.images.cam2",  # Modern v3 singular image key
+                        "observation/state": "observation.state",             # Modern namespaced state
                         "actions": "action",                      # Maps dataset singular 'action' to model 'actions'
                     }
                 )
@@ -1092,9 +1093,9 @@ _CONFIGS = [
         data=KoboDataConfig(
             repo_id="local/bimanual_cube",
             use_delta_actions=False,
-            root=pathlib.Path("/home/fabian/lev3_dataset_cube_task_space"),
+            root=pathlib.Path("/home/fabian/lev3_dataset_cube_task_space_orange_external_gripper_shifted"),
             # Add the literal text string directly here!
-            default_prompt="pick up the cube and place it on the red tape",
+            default_prompt="pick up the orange cube and place it on the red tape",
             base_config=DataConfig(
                 # Change this to False so OpenPI relies on your clean string 
                 # instead of attempting the broken index lookup math

@@ -164,7 +164,7 @@ class Unnormalize(DataTransformFn):
             data,
             self.norm_stats,
             self._unnormalize_quantile if self.use_quantiles else self._unnormalize,
-            strict=True,
+            strict=False,
         )
 
     def _unnormalize(self, x, stats: NormStats):

@@ -73,31 +73,33 @@ class VisionTransformerPredictorAC(nn.Module):
         ))
 
     def forward(self, x, actions):
-        """
-        :param x: Visual context tokens from VLA prefix layer [B, H * W, Embed_Dim] (Single frame context)
-        :param actions: Actuator targets [B, T, Action_Dim]
-        """
         B, N_patches, D_in = x.size()
         T = self.num_frames
-        
-        # 1. Project to core predictor space
-        x = self.predictor_embed(x)      # [B, H * W, D]
+
+        # Project sizes
+        x = self.predictor_embed(x)
         D = x.size(-1)
 
-        # 2. NEW: Expand the single-frame context across the temporal horizon T
-        # This duplicates the spatial layout so it can match the step-by-step action sequence
-        x = x.unsqueeze(1).repeat(1, T, 1, 1)  # [B, T, H * W, D]
+        x = x.unsqueeze(1).repeat(1, T, 1, 1)
+        a = self.action_encoder(actions).view(B, T, self.num_add_tokens, D)
+        x = torch.cat([a, x], dim=2).flatten(1, 2)
 
-        # 3. Encode action sequence chunk
-        a = self.action_encoder(actions)       # [B, T, D]
-        a = a.view(B, T, self.num_add_tokens, D) # [B, T, A, D]
+        # FIX: Lazy-cache the mask on the correct device instead of rebuilding it
+        if not hasattr(self, "_cached_attn_mask") or self._cached_attn_mask.size(0) != x.size(1):
+            cam_multiplier = N_patches // (self.grid_height * self.grid_width)
+            effective_width = self.grid_width * cam_multiplier
+            
+            # Build once
+            raw_mask = build_action_block_causal_attention_mask(
+                T=T, H=self.grid_height, W=effective_width, add_tokens=self.num_add_tokens
+            )
+            self._cached_attn_mask = raw_mask[:x.size(1), :x.size(1)].to(x.device)
+            self._effective_width = effective_width
 
-        # 4. Interleave action slots into frame visual arrays
-        # (This line will now execute safely because shapes match perfectly)
-        x = torch.cat([a, x], dim=2).flatten(1, 2)  # [B, T * (A + H*W), D]
-
-        # Fetch register buffer block mask
-        attn_mask = self.attn_mask[: x.size(1), : x.size(1)]
+        # Retrieve cached elements instantly
+        attn_mask = self._cached_attn_mask
+        effective_width = self._effective_width
+        # -----------------------------------------------------------------
 
         # 5. Process sequence layers through the Meta blocks
         for blk in self.predictor_blocks:
@@ -107,13 +109,14 @@ class VisionTransformerPredictorAC(nn.Module):
                 attn_mask=attn_mask,
                 T=T,
                 H=self.grid_height,
-                W=self.grid_width,
+                W=effective_width,
                 action_tokens=self.num_add_tokens,
             )
 
         # 6. Extract vision sequence out, stripping action slots
-        x = x.view(B, T, self.num_add_tokens + self.grid_height * self.grid_width, D)
-        x = x[:, :, self.num_add_tokens :, :].flatten(1, 2) # Restored back to [B, T * H * W, D]
+        # FIX: Also update the unflattening shape right below the block loop
+        x = x.view(B, T, self.num_add_tokens + N_patches, D)
+        x = x[:, :, self.num_add_tokens :, :].flatten(1, 2)
 
         x = self.predictor_norm(x)
         x = self.predictor_proj(x)

@@ -70,13 +70,15 @@ class OfflineInference:
         frame_delta_seconds = 1.0 / self.args.fps
 
         image_deltas = [i * frame_delta_seconds for i in range(0, self.args.horizon + 1)]
+        state_deltas = [i * frame_delta_seconds for i in range(0, self.args.horizon + 1)]
         action_deltas = [i * frame_delta_seconds for i in range(0, self.args.horizon)]
 
         delta_timestamps = {
             self.args.cam_in_hand: image_deltas,
             self.args.cam_external: image_deltas,
+            self.args.state: state_deltas,
             "action": action_deltas,
-        }
+            }
         dataset = LeRobotDataset(self.args.repo_id, self.args.root, delta_timestamps=delta_timestamps)
 
         dataloader = DataLoader(
@@ -90,53 +92,70 @@ class OfflineInference:
 
         return dataloader
 
-    def get_vla_latent_predictions(self, visual_seq, state_seq):
-        """Placeholder method simulating VLA latent state trajectory generation.
+    def get_vla_latent_predictions(self, example_batch):
+        """Processes the exact observation layout required by the VLA.
         
         Args:
-            visual_seq: [B, T, C, H, W] Tensor of synchronized camera frames
-            state_seq:  [B, T, state_dim] Tensor of system states
+            example_batch: Dict containing 'observation/image', 'observation/external_image', 
+                          'observation/state', and 'prompt' keys as batch tensors.
         Returns:
-            predicted_latents: [B, horizon, latent_dim] predicted target embeddings
+            predicted_latents: [B, horizon, latent_dim] predicted target embeddings.
         """
-        batch_size = visual_seq.shape[0]
-        latent_dim = 256  # Match this to your JEPA projection head dimension
-        
-        # Simulating a 4-step lookahead prediction output (t1, t2, t3, t4)
-        return torch.zeros((batch_size, self.args.horizon, latent_dim))
-
+        # Placeholder simulating the internal forward pass of the VLA predictive world model
+        #batch_size = example_batch["observation/state"].shape[0]
+        latent_dim = 256
+        prefix_token, prefix_mask, prefix_ar_mask = self.policy.get_prefix_features(example_batch)  # Ensure the method is called to trigger any internal state updates
+        return prefix_token
+    
     def run_inference(self):
         rospy.loginfo("⚡ Starting high-efficiency JEPA latent evaluation loop...")
 
         with torch.no_grad():
             for batch_idx, batch in enumerate(self.dataloader):
-                # 1. Gather sequence blocks directly onto the GPU
-                cam_hand_seq = batch[self.args.cam_in_hand].to(self.device, dtype=self.dtype)
-                cam_ext_seq = batch[self.args.cam_external].to(self.device, dtype=self.dtype)
-                state_seq = batch[self.args.state].to(self.device, dtype=self.dtype)
-
-                # 2. Extract Ground Truth target features for your JEPA loss calculation
-                # Slice out t1..t4 to serve as the prediction targets for the world model
-                target_visual_future_hand = cam_hand_seq[:, 1:] 
-                target_visual_future_ext = cam_ext_seq[:, 1:]
+                rospy.loginfo(f"Processing batch {batch_idx + 1}/{len(self.dataloader)}")
                 
-                # 3. Call your VLA latent state predictor hook
-                # We feed the entire tensor context so the model can process temporal history or anchors
-                predicted_latents = self.get_vla_latent_predictions(cam_hand_seq, state_seq)
+                # 1. Capture base sequences exactly how they are structured natively
+                cam_in_hand = batch[self.args.cam_in_hand]  
+                cam_external = batch[self.args.cam_external]  
+                state_tensor = batch[self.args.state]
 
-                # --- 4. ENGINE JEPA LOSS CALCULATION ---
-                # Now your forward loop is fully equipped to pass predicted_latents and 
-                # target futures directly to your energy-based alignment checks:
-                #
-                # target_latents = self.jepa_target_encoder(target_visual_future_hand, target_visual_future_ext)
-                # jepa_loss = self.compute_energy_loss(predicted_latents, target_latents)
+                for b in range(cam_in_hand.shape[0]):
+                    # 2. Extract t0 elements into CPU NumPy arrays (preserving your exact working pipeline)
+                    img_t0_hand = cam_in_hand[b, 0].permute(1, 2, 0).detach().cpu().numpy()
+                    img_t0_ext = cam_external[b, 0].permute(1, 2, 0).detach().cpu().numpy()
+                    current_task_space_state = state_tensor[b, 0].detach().cpu().numpy()
+                    # Handle standard denormalization checks safely
+                    if img_t0_hand.dtype != np.uint8:
+                        img_t0_hand = (img_t0_hand * 255.0).astype(np.uint8) if np.max(img_t0_hand) <= 1.0 else img_t0_hand.astype(np.uint8)
+                    if img_t0_ext.dtype != np.uint8:
+                        img_t0_ext = (img_t0_ext * 255.0).astype(np.uint8) if np.max(img_t0_ext) <= 1.0 else img_t0_ext.astype(np.uint8)
 
-                if batch_idx % 100 == 0:
-                    rospy.loginfo(
-                        f"[Batch {batch_idx:05d}/{len(self.dataloader)}] "
-                        f"Target Future Shapes -> Hand Cam: {target_visual_future_hand.shape} | "
-                        f"Predicted Latents: {predicted_latents.shape}"
-                    )
+                    # 3. Build observation payload matching OpenPI policy conventions
+                    example = {
+                        "observation/image": img_t0_hand,  
+                        "observation/external_image": img_t0_ext,
+                        "observation/state": current_task_space_state,
+                        "prompt": "pick up the orange cube and place it on the red tape",
+                        "action": np.zeros((10, 32), dtype=np.float32),
+                    }
+
+                    # 4. Trigger the VLA latent predictor using the exact signature required
+                    predicted_latents = self.get_vla_latent_predictions(example)
+
+                    # 5. Extract target visual future horizons (t1..t4) onto GPU for JEPA loss optimization
+                    # Slicing via [b:b+1, 1:] preserves the batch dimension for your network layers
+                    #target_visual_future_hand = cam_in_hand[b:b+1, 1:].to(self.device, dtype=self.dtype)
+                    target_visual_future_ext = cam_external[b:b+1, 1:].to(self.device, dtype=self.dtype)
+
+                    # --- 6. CORE JEPA ALIGNMENT EXECUTION ---
+                    # target_latents = self.jepa_target_encoder(target_visual_future_hand, target_visual_future_ext)
+                    # jepa_loss = self.compute_jepa_loss(predicted_latents, target_latents)
+
+                    if batch_idx % 100 == 0:
+                        print(
+                            f"[Batch {batch_idx:04d} | Item {b}] "
+                            f"Predicted Latents Shape: {predicted_latents.shape} | "
+                        )
 
 if __name__ == "__main__":
     inference_system = OfflineInference()

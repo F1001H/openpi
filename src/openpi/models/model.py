@@ -282,6 +282,9 @@ class BaseModel(nnx.Module, abc.ABC):
     @abc.abstractmethod
     def sample_actions(self, rng: at.KeyArrayLike, observation: Observation, **kwargs) -> Actions: ...
 
+    @abc.abstractmethod 
+    def get_prefix_features(self, observation: Observation) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]: ...
+
 
 def restore_params(
     params_path: pathlib.Path | str,

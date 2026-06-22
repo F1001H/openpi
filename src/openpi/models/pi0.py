@@ -277,3 +277,9 @@ class Pi0(_model.BaseModel):
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0
+    
+    @override
+    def get_prefix_features(self, observation: _model.Observation) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        return prefix_tokens, prefix_mask, prefix_ar_mask
+

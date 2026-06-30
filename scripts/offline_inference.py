@@ -25,7 +25,7 @@ class OfflineInference:
         self.dtype = torch.bfloat16
 
         self.args = self.parse_args()
-        # Setup policy after parsing arguments to ensure clean configuration paths
+
         self.policy = self.setup_policy()
         self.dataloader = self.load_data()
 
@@ -93,18 +93,7 @@ class OfflineInference:
         return dataloader
 
     def get_vla_latent_predictions(self, example_batch):
-        """Processes the exact observation layout required by the VLA.
-        
-        Args:
-            example_batch: Dict containing 'observation/image', 'observation/external_image', 
-                          'observation/state', and 'prompt' keys as batch tensors.
-        Returns:
-            predicted_latents: [B, horizon, latent_dim] predicted target embeddings.
-        """
-        # Placeholder simulating the internal forward pass of the VLA predictive world model
-        #batch_size = example_batch["observation/state"].shape[0]
-        latent_dim = 256
-        prefix_token, prefix_mask, prefix_ar_mask = self.policy.get_prefix_features(example_batch)  # Ensure the method is called to trigger any internal state updates
+        prefix_token, prefix_mask, prefix_ar_mask = self.policy.get_prefix_features(example_batch)
         return prefix_token
     
     def run_inference(self):
@@ -113,49 +102,71 @@ class OfflineInference:
         with torch.no_grad():
             for batch_idx, batch in enumerate(self.dataloader):
                 rospy.loginfo(f"Processing batch {batch_idx + 1}/{len(self.dataloader)}")
-                
-                # 1. Capture base sequences exactly how they are structured natively
-                cam_in_hand = batch[self.args.cam_in_hand]  
-                cam_external = batch[self.args.cam_external]  
-                state_tensor = batch[self.args.state]
+                prefix_data, target_future_hand, target_future_ext = self.evaluate_batch(batch)
+                if batch_idx % 100 == 0:
+                    print(
+                        f"[Batch {batch_idx:04d}] "
+                        f"Predicted Latents Shape: {prefix_data[0].shape}"
+                    )
 
-                for b in range(cam_in_hand.shape[0]):
-                    # 2. Extract t0 elements into CPU NumPy arrays (preserving your exact working pipeline)
-                    img_t0_hand = cam_in_hand[b, 0].permute(1, 2, 0).detach().cpu().numpy()
-                    img_t0_ext = cam_external[b, 0].permute(1, 2, 0).detach().cpu().numpy()
-                    current_task_space_state = state_tensor[b, 0].detach().cpu().numpy()
-                    # Handle standard denormalization checks safely
-                    if img_t0_hand.dtype != np.uint8:
-                        img_t0_hand = (img_t0_hand * 255.0).astype(np.uint8) if np.max(img_t0_hand) <= 1.0 else img_t0_hand.astype(np.uint8)
-                    if img_t0_ext.dtype != np.uint8:
-                        img_t0_ext = (img_t0_ext * 255.0).astype(np.uint8) if np.max(img_t0_ext) <= 1.0 else img_t0_ext.astype(np.uint8)
+    def evaluate_batch(self, batch):
+        cam_in_hand = batch[self.args.cam_in_hand]    # Shape: [B, T, C, H, W]
+        cam_external = batch[self.args.cam_external]  # Shape: [B, T, C, H, W]
+        state_tensor = batch[self.args.state]         # Shape: [B, T, D]
+        
+        batch_size = cam_in_hand.shape[0]
+        prefix_data_list = []
 
-                    # 3. Build observation payload matching OpenPI policy conventions
-                    example = {
-                        "observation/image": img_t0_hand,  
-                        "observation/external_image": img_t0_ext,
-                        "observation/state": current_task_space_state,
-                        "prompt": "pick up the orange cube and place it on the red tape",
-                        "action": np.zeros((10, 32), dtype=np.float32),
-                    }
+        # 1. Loop through each element in the batch to generate token payloads
+        for b in range(batch_size):
+            img_t0_hand = cam_in_hand[b, 0].permute(1, 2, 0).detach().cpu().numpy()
+            img_t0_ext = cam_external[b, 0].permute(1, 2, 0).detach().cpu().numpy()
+            current_task_space_state = state_tensor[b, 0].detach().cpu().numpy()
 
-                    # 4. Trigger the VLA latent predictor using the exact signature required
-                    predicted_latents = self.get_vla_latent_predictions(example)
+            if img_t0_hand.dtype != np.uint8:
+                img_t0_hand = (img_t0_hand * 255.0).astype(np.uint8) if np.max(img_t0_hand) <= 1.0 else img_t0_hand.astype(np.uint8)
+            if img_t0_ext.dtype != np.uint8:
+                img_t0_ext = (img_t0_ext * 255.0).astype(np.uint8) if np.max(img_t0_ext) <= 1.0 else img_t0_ext.astype(np.uint8)
 
-                    # 5. Extract target visual future horizons (t1..t4) onto GPU for JEPA loss optimization
-                    # Slicing via [b:b+1, 1:] preserves the batch dimension for your network layers
-                    #target_visual_future_hand = cam_in_hand[b:b+1, 1:].to(self.device, dtype=self.dtype)
-                    target_visual_future_ext = cam_external[b:b+1, 1:].to(self.device, dtype=self.dtype)
+            obs_payload = {
+                "observation/image": img_t0_hand,  
+                "observation/external_image": img_t0_ext,
+                "observation/state": current_task_space_state,
+                "prompt": "pick up the orange cube and place it on the red tape",
+                "action": np.zeros((10, 32), dtype=np.float32),
+            }
 
-                    # --- 6. CORE JEPA ALIGNMENT EXECUTION ---
-                    # target_latents = self.jepa_target_encoder(target_visual_future_hand, target_visual_future_ext)
-                    # jepa_loss = self.compute_jepa_loss(predicted_latents, target_latents)
+            # Extracts single item features -> List containing [Tokens Tensor]
+            single_prefix = self.policy.get_prefix_features(obs_payload)
+            
+            # Remove the batch dimension added by the inner engine if it outputs [1, 968, 2048]
+            token_tensor = single_prefix[0]
+            if isinstance(token_tensor, torch.Tensor):
+                if token_tensor.dim() == 3 and token_tensor.shape[0] == 1:
+                    token_tensor = token_tensor.squeeze(0)
+            else:
+                if len(token_tensor.shape) == 3 and token_tensor.shape[0] == 1:
+                    token_tensor = token_tensor.squeeze(0)
+                    
+            prefix_data_list.append(token_tensor)
 
-                    if batch_idx % 100 == 0:
-                        print(
-                            f"[Batch {batch_idx:04d} | Item {b}] "
-                            f"Predicted Latents Shape: {predicted_latents.shape} | "
-                        )
+        # 2. Stack tokens back together along the batch axis
+        if isinstance(prefix_data_list[0], torch.Tensor):
+            prefix_data_combined = torch.stack(prefix_data_list, dim=0) # Shape: [B, 968, 2048]
+        else:
+            # FIX: Force NumPy to stack/cast to standard float32 first to pass PyTorch's strict type guard
+            np_stacked = np.stack(prefix_data_list, axis=0).astype(np.float32)
+            prefix_data_combined = torch.from_numpy(np_stacked).to(self.device, dtype=self.dtype)
+            
+        # Wrap back in a list to preserve the exact interface output expected by train_jepa.py
+        prefix_data = [prefix_data_combined]
+
+        # 3. Vectorized tensor extraction for future targets across the entire batch slicing
+        target_future_hand = cam_in_hand[:, 1:].to(self.device, dtype=self.dtype)
+        target_future_ext = cam_external[:, 1:].to(self.device, dtype=self.dtype)
+
+        return prefix_data, target_future_hand, target_future_ext
+
 
 if __name__ == "__main__":
     inference_system = OfflineInference()

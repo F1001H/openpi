@@ -111,29 +111,28 @@ class Policy(BasePolicy):
     def metadata(self) -> dict[str, Any]:
         return self._metadata
     
-    def get_prefix_features(self, obs: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        inputs = jax.tree.map(lambda x: x, obs)
-        inputs = self._input_transform(inputs)
-        if not self._is_pytorch_model:
-            inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
-            self._rng, prefix_rng_or_pytorch_device = jax.random.split(self._rng)
-        else:
-            inputs = jax.tree.map(lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device)[None, ...], inputs)
-            prefix_rng_or_pytorch_device = self._pytorch_device
+    def get_prefix_features(self, obs: dict) -> tuple[Any, Any, Any]:
+            inputs = jax.tree.map(lambda x: x, obs)
+            inputs = self._input_transform(inputs)
+            
+            if not self._is_pytorch_model:
+                inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
+                self._rng, prefix_rng_or_pytorch_device = jax.random.split(self._rng)
+            else:
+                inputs = jax.tree.map(lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device)[None, ...], inputs)
+                prefix_rng_or_pytorch_device = self._pytorch_device
 
-        observation = _model.Observation.from_dict(inputs)
-        prefix_tokens, prefix_mask, prefix_ar_mask = self._get_prefix_features(observation)
+            observation = _model.Observation.from_dict(inputs)
+            prefix_tokens, prefix_mask, prefix_ar_mask = self._get_prefix_features(observation)
 
-        if self._is_pytorch_model:
-            prefix_tokens = np.asarray(prefix_tokens.cpu())
-            prefix_mask = np.asarray(prefix_mask.cpu())
-            prefix_ar_mask = np.asarray(prefix_ar_mask.cpu())
-        else:
-            prefix_tokens = np.asarray(prefix_tokens)
-            prefix_mask = np.asarray(prefix_mask)
-            prefix_ar_mask = np.asarray(prefix_ar_mask)
-
-        return prefix_tokens[0], prefix_mask[0], prefix_ar_mask[0]
+            # CLEANER ALTERNATIVE: Keep native PyTorch tensors, detach, and skip NumPy conversion
+            if self._is_pytorch_model:
+                return prefix_tokens[0].detach(), prefix_mask[0].detach(), prefix_ar_mask[0].detach()
+            else:
+                prefix_tokens = np.asarray(prefix_tokens)
+                prefix_mask = np.asarray(prefix_mask)
+                prefix_ar_mask = np.asarray(prefix_ar_mask)
+                return prefix_tokens[0], prefix_mask[0], prefix_ar_mask[0]
 
 
 class PolicyRecorder(_base_policy.BasePolicy):

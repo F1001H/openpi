@@ -1,27 +1,3 @@
-# Flax NNX port of facebookresearch/vjepa2 src/models/utils/modules.py (ACBlock and friends).
-#
-# IMPORTANT PROVENANCE NOTE:
-# The original `modules.py` source could not be fetched directly (GitHub blocks
-# automated access to that code-browser path). This port is reconstructed from:
-#   - the VisionTransformerPredictorAC source you provided (confirms `attn.proj`
-#     and `mlp.fc2` attribute names via `_rescale_blocks`)
-#   - the V-JEPA2 paper (arxiv.org/abs/2506.09985): 24 layers, 16 heads, 1024
-#     hidden dim, GELU, 3D-RoPE for patch tokens / 1D (temporal-only) RoPE for
-#     action-state tokens, block-causal attention (full attention within a
-#     frame, causal across frames)
-#   - Meta's standard ViT block convention used across their JEPA repos
-#     (norm1 -> attn.qkv/attn.proj -> norm2 -> mlp.fc1/mlp.fc2)
-#
-# WHAT IS NOT VERIFIED: the exact RoPE frequency convention (theta base, how
-# head_dim is split across the t/h/w axes) and the precise implementation of
-# `build_action_block_causal_attention_mask`. These have no learnable
-# parameters, so a pretrained checkpoint will *load* successfully even if
-# these details are off -- but the numerics of the loaded model may not match
-# Meta's original outputs. Before trusting this for fine-tuning, run the
-# parity check described in convert_checkpoint.py (compare this module's
-# output against the original PyTorch predictor on identical inputs, if you
-# have PyTorch + the original repo available on some machine to cross-check).
-
 import math
 from typing import Optional
 

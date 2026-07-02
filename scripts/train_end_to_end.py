@@ -18,6 +18,7 @@ import jax.experimental
 import jax.numpy as jnp
 import numpy as np
 import optax
+import orbax.checkpoint as ocp
 import tqdm_loggable.auto as tqdm
 import wandb
 
@@ -82,7 +83,6 @@ class OpenPIWithJEPA(nnx.Module):
         """
         Extract visual token features from the base VLA policy model representation space.
         """
-        # Checks if your base model class exposes an explicit method, otherwise fall back to common hooks
         if hasattr(self.base_model, "extract_vision_latents"):
             return self.base_model.extract_vision_latents(obs)
         elif hasattr(self.base_model, "backbone") and hasattr(self.base_model.backbone, "extract_features"):
@@ -120,26 +120,23 @@ def train_step(
     ):
         vla_rng, jepa_rng = jax.random.split(step_rng)
         
+        # Re-bind structural RNG keys for this step execution to support stochastic layers
+        nnx.rebind(model_inst, nnx.Rngs(dropout=jepa_rng))
+        
         # --- Task 1: Policy Behavioral Cloning (BC) Core Loss ---
         l_bc = model_inst.compute_loss(vla_rng, obs, acts, train=True)
         l_bc_mean = jnp.mean(l_bc)
 
         # --- Task 2: Action-Conditioned JEPA State-Space Transitions ---
-        # Extract visual feature tracks directly out of the active encoder backbone representation space
         z_context = model_inst.extract_vision_latents(obs)
-        
-        # Safely capture proprioceptive feedback or default to direct kinematic representations
         proprio_states = obs.get("state", acts)
         
         # Feed token dynamics directly into our Action-Conditioned Predictor structure
         z_pred = model_inst.jepa_predictor(z_context, acts, proprio_states)
         
         # --- Task 3: Momentum Target Evaluation (EMA Path) ---
-        # Safeguard structural weights against optimization collapse using an explicit stop_gradient boundary
         target_model = nnx.merge(state.model_def, jax.lax.stop_gradient(state.ema_params))
         h_raw = target_model.extract_vision_latents(obs)
-        
-        # Apply normalization transformation to balance multi-layer distillation target variances
         h = model_inst.target_norm(h_raw)
 
         # --- Task 4: Combined Optimization Objective Resolution ---
@@ -274,11 +271,24 @@ def init_train_state(
         rng, jepa_rng = jax.random.split(rng)
         model = OpenPIWithJEPA(base_model, config, nnx.Rngs(jepa_rng))
 
+        # 3. Apply base OpenPI model partial parameters safely without blowing away the JEPA branch
         if partial_params is not None:
             graphdef, state = nnx.split(model)
-            state.replace_by_pure_dict(partial_params)
+            state.update_by_pure_dict(partial_params)
             model = nnx.merge(graphdef, state)
 
+        # 4. Inject standalone converted V-JEPA predictor state dictionary
+        if hasattr(config, "jepa_predictor_ckpt") and config.jepa_predictor_ckpt:
+            mngr = ocp.CheckpointManager(epath.Path(config.jepa_predictor_ckpt).expanduser())
+            jepa_state_dict = mngr.restore(mngr.latest_step())
+            
+            # Split out, update, and recombine the specific predictor subgraph
+            pred_graph, pred_state = nnx.split(model.jepa_predictor)
+            pred_state.update_by_pure_dict(jepa_state_dict)
+            nnx.update(model.jepa_predictor, pred_state)
+            logging.info(f"Successfully injected converted V-JEPA weights from: {config.jepa_predictor_ckpt}")
+
+        # Extract complete state representation maps and cast to bfloat16
         params = nnx.state(model)
         params = nnx_utils.state_map(params, config.freeze_filter, lambda p: p.replace(p.value.astype(jnp.bfloat16)))
 

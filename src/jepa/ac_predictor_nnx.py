@@ -108,9 +108,15 @@ class VisionTransformerPredictorAC(nnx.Module):
         if self.is_frame_causal:
             grid_depth = self.num_frames // self.tubelet_size
             add_tokens = 3 if use_extrinsics else 2
-            self.attn_mask = build_action_block_causal_attention_mask(
+            mask = build_action_block_causal_attention_mask(
                 grid_depth, self.grid_height, self.grid_width, add_tokens
             )
+            # Wrap as a non-Param nnx.Variable: raw jax/numpy arrays can't be
+            # bare Module attributes in NNX (nnx.state/split/merge will raise
+            # "Array leaves are not supported"). Using the generic Variable
+            # (not nnx.Param) keeps it out of trainable_filter/freeze_filter,
+            # which target nnx.Param specifically.
+            self.attn_mask = nnx.Variable(mask)
 
     def _rescale_blocks(self):
         """Mirrors the PyTorch _rescale_blocks: divide attn.proj and mlp.fc2
@@ -142,7 +148,11 @@ class VisionTransformerPredictorAC(nnx.Module):
             x = jnp.concatenate([a, s, x], axis=2).reshape(B, -1, D)
 
         cond_tokens = 3 if self.use_extrinsics else 2
-        attn_mask = self.attn_mask[: x.shape[1], : x.shape[1]] if self.attn_mask is not None else None
+        attn_mask = (
+            self.attn_mask.value[: x.shape[1], : x.shape[1]]
+            if self.attn_mask is not None
+            else None
+        )
 
         for blk in self.predictor_blocks:
             x = blk(x, mask=None, attn_mask=attn_mask, T=T, H=self.grid_height,

@@ -119,9 +119,9 @@ class LeRobotV3TransitionDataset(Dataset):
         repo_id_or_root: str,
         action_horizon: int,
         camera_keys: Optional[list[str]] = None,
-        is_local_root: bool = False,
+        is_local_root: bool = True,
     ):
-        base_kwargs = {"root": repo_id_or_root} if is_local_root else {"repo_id": repo_id_or_root}
+        base_kwargs = {"root": repo_id_or_root, "repo_id": repo_id_or_root} if is_local_root else {"repo_id": repo_id_or_root}
         # First pass: instantiate without delta_timestamps just to read fps/meta.
         probe = LeRobotDataset(**base_kwargs)
         fps = probe.fps

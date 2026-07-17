@@ -1065,19 +1065,20 @@ _CONFIGS = [
         name="pi0_kobo_cube",
         # Full fine-tuning utilizing the base Pi0 model architecture setup
         model=pi0_config.Pi0Config(
-            action_dim=7,          # Matching your task-space vector dimension (3D translation + 4D quaternion)
-            action_horizon=10,     # The number of forward rollout target steps per model prediction chunk
-        ),
+            pi05=True,
+            discrete_state_input=False,
+            action_horizon=10        
+            ),
         data=KoboDataConfig(
             repo_id="local/bimanual_cube",
-            use_delta_actions=True, # Transforms workspace spatial positions into relative displacement vectors
+            use_delta_actions=False, # Transforms workspace spatial positions into relative displacement vectors
             base_config=DataConfig(
                 prompt_from_task=True,
                 root=pathlib.Path("/home/fabian/lev3_dataset_cube_task_space"),  # Native dataset v3 target path
             ),
         ),
         # Initialize weights from the standardized upstream base parameters
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
         batch_size=32,
     ),

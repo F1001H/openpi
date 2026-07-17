@@ -15,7 +15,7 @@ import math
 import jax.numpy as jnp
 from flax import nnx
 
-from modules_nnx import (
+from jepa.modules_nnx import (
     ACBlock,
     build_action_block_causal_attention_mask,
     trunc_normal_init,
@@ -78,8 +78,8 @@ class VisionTransformerPredictorAC(nnx.Module):
         act_layer = nnx.silu if use_silu else nnx.gelu
         norm_layer = functools.partial(nnx.LayerNorm, epsilon=norm_epsilon)
 
-        self.predictor_blocks = [
-            ACBlock(
+        self.predictor_blocks = {
+            str(i): ACBlock(
                 dim=predictor_embed_dim,
                 num_heads=num_heads,
                 mlp_ratio=mlp_ratio,
@@ -95,8 +95,9 @@ class VisionTransformerPredictorAC(nnx.Module):
                 wide_silu=wide_silu,
                 rngs=rngs,
             )
-            for _ in range(depth)
-        ]
+            for i in range(depth)
+        }
+        self._depth = depth
 
         self.predictor_norm = norm_layer(predictor_embed_dim, rngs=rngs)
         self.predictor_proj = nnx.Linear(predictor_embed_dim, embed_dim, use_bias=True,
@@ -121,8 +122,9 @@ class VisionTransformerPredictorAC(nnx.Module):
     def _rescale_blocks(self):
         """Mirrors the PyTorch _rescale_blocks: divide attn.proj and mlp.fc2
         kernels by sqrt(2 * layer_id) post-init."""
-        for layer_id, blk in enumerate(self.predictor_blocks, start=1):
-            scale = math.sqrt(2.0 * layer_id)
+        for i in range(self._depth):
+            blk = self.predictor_blocks[str(i)]
+            scale = math.sqrt(2.0 * (i + 1))
             blk.attn.proj.kernel.value = blk.attn.proj.kernel.value / scale
             blk.mlp.fc2.kernel.value = blk.mlp.fc2.kernel.value / scale
 
@@ -154,7 +156,8 @@ class VisionTransformerPredictorAC(nnx.Module):
             else None
         )
 
-        for blk in self.predictor_blocks:
+        for i in range(self._depth):
+            blk = self.predictor_blocks[str(i)]
             x = blk(x, mask=None, attn_mask=attn_mask, T=T, H=self.grid_height,
                      W=self.grid_width, action_tokens=cond_tokens, deterministic=deterministic)
 

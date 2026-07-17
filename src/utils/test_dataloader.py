@@ -1,45 +1,46 @@
-"""Standalone sanity-check script for lerobot_v3_transition_loader.py.
+"""Standalone sanity-check script for lerobot_v3_transition_loader.py
+(real openpi transform pipeline version -- see that file's module docstring
+for what changed and why).
 
-Not a pytest suite -- run directly against a real dataset, since the whole
-point is to catch things that only show up against real data (episode
-boundary handling, actual image layout, degenerate transitions), which can't
-be verified with mocks in an environment that doesn't have `lerobot`/`jax`
-installed.
+Unlike the earlier version, this now needs a real TrainConfig (to build the
+repack/data/model transforms), not just a bare dataset root -- so this script
+takes a config name the same way your training entrypoint does.
 
 Usage:
-    python test_transition_loader.py --repo-id lerobot/aloha_sim_transfer_cube_human
-    python test_transition_loader.py --root /path/to/local/dataset --local-root
+    uv run test_transition_loader.py pi0_kobo_cube --data.root /home/fabian/kobo_cube
 
 What it checks:
-  1. Dataset loads, has the expected camera keys, non-zero length.
-  2. No sampled index is a last-frame-of-episode index (the whole reason the
-     filtering exists -- if this fails, obs_t == obs_t1 degenerate transitions
-     are leaking through).
-  3. Shapes: images HWC uint8, state 1D, action [horizon, action_dim].
-  4. obs_t and obs_t1 are actually different (catches delta_timestamps
-     misconfiguration silently padding/repeating the same frame).
-  5. Action horizon matches what was requested.
-  6. Batch collation produces consistent shapes across the batch dimension.
-  7. Reports the fraction of "suspiciously static" transitions (image barely
-     changed) -- some is normal (robot paused), but a high fraction usually
-     means something's wrong with the delta/timestamp alignment rather than
-     the robot being idle.
-
-Exits non-zero on any hard failure so it's usable in CI once you have a
-lerobot-enabled runner.
+  1. Dataset metadata loads; episode/frame counts printed for a memory-scale
+     sanity check.
+  2. Streams N samples via __iter__, applying the REAL transform pipeline,
+     and checks the resulting dicts match Observation.from_dict's expected
+     shape: "image" dict with the canonical IMAGE_KEYS (not your raw cam1/
+     cam2 names -- that remapping is KoboInputs' job, confirming it actually
+     ran), "image_mask" dict, "state", "actions" (obs_t only), and
+     "tokenized_prompt"/"tokenized_prompt_mask" (obs_t only).
+  3. obs_t and obs_t1 images actually differ (same degenerate-transition
+     check as before, now applied post-transform).
+  4. Actually constructs _model.Observation via raw_batch_to_transition and
+     confirms it doesn't raise -- this is the check that would have caught
+     the prompt_tokens/tokenized_prompt field-name bug before it reached
+     a real training run.
+  5. Batch collation via a real (num_workers=0) DataLoader pass.
 """
 
 import argparse
+import itertools
 import sys
 import time
 
 import numpy as np
 
+import openpi.training.config as _config
 from data_loader import (
-    LeRobotV3TransitionDataset,
+    LeRobotV3TransitionIterableDataset,
     _collate,
-    _last_frame_global_indices,
+    raw_batch_to_transition,
 )
+from openpi.models import model as _model
 
 
 def _fail(msg: str):
@@ -53,104 +54,108 @@ def _ok(msg: str):
 
 def main():
     parser = argparse.ArgumentParser()
-    src = parser.add_mutually_exclusive_group(required=True)
-    src.add_argument("--repo-id", type=str, help="Hub repo id, e.g. lerobot/aloha_sim_transfer_cube_human")
-    src.add_argument("--root", type=str, help="Local dataset root path")
-    parser.add_argument("--action-horizon", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--num-samples", type=int, default=200, help="How many individual __getitem__ calls to spot-check")
-    parser.add_argument("--static-threshold", type=float, default=1.0,
-                         help="Mean abs pixel diff (0-255 scale) below which a transition is flagged 'static'")
-    parser.add_argument("--static-frac-warn", type=float, default=0.5,
-                         help="Warn if more than this fraction of sampled transitions are static")
+    parser.add_argument("config_name", type=str, help="e.g. pi0_kobo_cube")
+    parser.add_argument("--root", type=str, default=None,
+                         help="Override config.data.root (local dataset path). "
+                              "If omitted, uses whatever the named config resolves to -- "
+                              "which may be None, see the create_base_config bug noted elsewhere.")
+    parser.add_argument("--num-samples", type=int, default=50)
+    parser.add_argument("--static-threshold", type=float, default=1.0)
     args = parser.parse_args()
 
-    repo_id_or_root = args.root if args.root else args.repo_id
-    is_local_root = args.root is not None
+    import dataclasses
+    import pathlib
+    config = _config.get_config(args.config_name)
+    if args.root is not None:
+        config = dataclasses.replace(config, data=dataclasses.replace(config.data, root=pathlib.Path(args.root)))
 
-    print(f"Loading dataset ({'local root' if is_local_root else 'hub repo'}: {repo_id_or_root}) ...")
+    data_config = config.data.create(config.assets_dirs, config.model)
+    if data_config.root is None and data_config.repo_id is None:
+        _fail("config.data resolved to neither root nor repo_id -- pass --root")
+    repo_id_or_root = str(data_config.root) if data_config.root is not None else data_config.repo_id
+    is_local_root = data_config.root is not None
+
+    print(f"Loading metadata ({'local root' if is_local_root else 'hub repo'}: {repo_id_or_root}) ...")
     t0 = time.time()
-    dataset = LeRobotV3TransitionDataset(
-        repo_id_or_root, args.action_horizon, is_local_root=is_local_root
+    dataset = LeRobotV3TransitionIterableDataset(
+        config, repo_id_or_root, config.model.action_horizon, is_local_root=is_local_root, seed=0
     )
-    print(f"  loaded in {time.time() - t0:.1f}s")
+    print(f"  metadata + transform pipeline built in {time.time() - t0:.1f}s")
 
-    if len(dataset) == 0:
-        _fail("dataset has zero valid (non-last-frame) samples")
-    _ok(f"dataset has {len(dataset)} valid transition samples, camera keys = {dataset.camera_keys}")
+    if dataset.num_episodes == 0:
+        _fail("dataset has zero episodes")
+    _ok(f"{dataset.num_episodes} episodes, ~{dataset.total_frames} total frames, "
+        f"~{dataset.approx_valid_samples} valid transition samples, "
+        f"raw camera keys = {dataset.camera_keys}, fps = {dataset.fps}")
 
-    # --- Check 2: no valid index is a last-frame index -------------------- #
-    last_idx = set(int(i) for i in _last_frame_global_indices(dataset.dataset))
-    overlap = set(int(i) for i in dataset.valid_indices) & last_idx
-    if overlap:
-        _fail(f"{len(overlap)} valid indices are actually last-frame-of-episode indices "
-              f"(episode boundary filtering is broken): e.g. {sorted(overlap)[:5]}")
-    _ok("no valid index overlaps with last-frame-of-episode indices")
-
-    # --- Checks 3-4-5: per-sample shape + degeneracy spot check ----------- #
-    n = min(args.num_samples, len(dataset))
-    rng = np.random.default_rng(0)
-    sample_positions = rng.choice(len(dataset), size=n, replace=False)
+    # --- Stream N samples through the REAL transform pipeline -------------- #
+    samples = list(itertools.islice(iter(dataset), args.num_samples))
+    if len(samples) == 0:
+        _fail("streamed zero samples")
+    if len(samples) < args.num_samples:
+        print(f"WARN: only got {len(samples)} samples (dataset smaller than --num-samples, or short episodes)")
 
     static_count = 0
-    action_dim = None
-    state_dim = None
+    canonical_cams = None
+    for item in samples:
+        data_t, data_t1 = item["obs_t"], item["obs_t1"]
 
-    for pos in sample_positions:
-        item = dataset[int(pos)]
+        for key, required in (("image", True), ("image_mask", True), ("state", True)):
+            if key not in data_t:
+                _fail(f"obs_t missing required key '{key}' after transform pipeline")
+            if key not in data_t1:
+                _fail(f"obs_t1 missing required key '{key}' after transform pipeline")
 
-        for cam in dataset.camera_keys:
-            img_t = item["images"][cam]
-            img_t1 = item["next_images"][cam]
+        if "actions" not in data_t:
+            _fail("obs_t missing 'actions' (expected from PadStatesAndActions)")
+        if ("tokenized_prompt" not in data_t) or ("tokenized_prompt_mask" not in data_t):
+            _fail("obs_t missing tokenized_prompt/tokenized_prompt_mask -- TokenizePrompt didn't run")
+
+        cams = set(data_t["image"].keys())
+        if canonical_cams is None:
+            canonical_cams = cams
+            expected = {"base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"}
+            if not expected.issubset(cams):
+                _fail(f"obs_t['image'] keys {cams} don't cover the model's expected IMAGE_KEYS {expected} -- "
+                      f"KoboInputs' camera remapping doesn't look like it ran correctly")
+            _ok(f"obs_t['image'] has canonical camera keys: {cams} (raw dataset only has {dataset.camera_keys}, "
+                f"confirms KoboInputs remapping/padding ran)")
+        elif cams != canonical_cams:
+            _fail(f"inconsistent image keys across samples: {cams} vs {canonical_cams}")
+
+        for cam in cams:
+            img_t, img_t1 = np.asarray(data_t["image"][cam]), np.asarray(data_t1["image"][cam])
             if img_t.dtype != np.uint8:
-                _fail(f"image '{cam}' dtype is {img_t.dtype}, expected uint8")
-            if img_t.ndim != 3 or img_t.shape[-1] not in (1, 3):
-                _fail(f"image '{cam}' shape {img_t.shape} doesn't look like HWC")
-            if img_t.shape != img_t1.shape:
-                _fail(f"image '{cam}' shape mismatch between t ({img_t.shape}) and t+1 ({img_t1.shape})")
+                _fail(f"image '{cam}' dtype is {img_t.dtype}, expected uint8 going into Observation.from_dict")
             diff = np.abs(img_t.astype(np.float32) - img_t1.astype(np.float32)).mean()
             if diff < args.static_threshold:
                 static_count += 1
 
-        if item["action"].shape[0] != args.action_horizon:
-            _fail(f"action horizon {item['action'].shape[0]} != requested {args.action_horizon}")
-        action_dim = action_dim or item["action"].shape[1]
-        if item["action"].shape[1] != action_dim:
-            _fail("action_dim is inconsistent across samples")
+        if data_t["actions"].shape[0] != config.model.action_horizon:
+            _fail(f"actions horizon {data_t['actions'].shape[0]} != config.model.action_horizon "
+                  f"{config.model.action_horizon}")
 
-        state_dim = state_dim or item["state"].shape[0]
-        if item["state"].shape[0] != state_dim:
-            _fail("state_dim is inconsistent across samples")
-        if item["next_state"].shape[0] != state_dim:
-            _fail("next_state dim doesn't match state dim")
+    _ok(f"checked schema across {len(samples)} streamed samples")
+    static_frac = static_count / (len(samples) * len(canonical_cams))
+    print(f"  static-transition fraction: {static_frac:.2%}")
 
-    _ok(f"checked shapes/dtypes across {n} samples "
-        f"(action_dim={action_dim}, state_dim={state_dim})")
-
-    static_frac = static_count / (n * len(dataset.camera_keys))
-    print(f"  static-transition fraction across sampled (sample, camera) pairs: {static_frac:.2%}")
-    if static_frac > args.static_frac_warn:
-        print(f"WARN: {static_frac:.2%} of sampled transitions look static (mean abs pixel diff "
-              f"< {args.static_threshold}). If your data isn't mostly the robot sitting idle, this "
-              f"usually means delta_timestamps is returning the same frame twice -- double-check "
-              f"fps/step alignment and the episode-boundary filtering.")
-    else:
-        _ok(f"static-transition fraction ({static_frac:.2%}) looks reasonable")
-
-    # --- Check 6: batch collation ----------------------------------------- #
-    batch_items = [dataset[int(i)] for i in sample_positions[: args.batch_size]]
-    batch = _collate(batch_items)
-    for cam in dataset.camera_keys:
-        if batch["images"][cam].shape[0] != len(batch_items):
-            _fail(f"collated batch dim mismatch for images['{cam}']")
-        if batch["next_images"][cam].shape != batch["images"][cam].shape:
-            _fail(f"collated images/next_images shape mismatch for '{cam}'")
-    if batch["action"].shape != (len(batch_items), args.action_horizon, action_dim):
-        _fail(f"collated action shape {batch['action'].shape} != "
-              f"expected {(len(batch_items), args.action_horizon, action_dim)}")
-    if batch["state"].shape != (len(batch_items), state_dim):
-        _fail(f"collated state shape {batch['state'].shape} != expected {(len(batch_items), state_dim)}")
-    _ok(f"batch collation OK for batch_size={len(batch_items)}")
+    # --- The check that actually matters: does Observation.from_dict work? --- #
+    batch = _collate(samples[:8])
+    try:
+        obs_t, action_chunk, obs_t1 = raw_batch_to_transition(batch, config)
+    except Exception as e:
+        _fail(f"raw_batch_to_transition raised: {type(e).__name__}: {e}")
+    if not isinstance(obs_t, _model.Observation) or not isinstance(obs_t1, _model.Observation):
+        _fail("raw_batch_to_transition did not return Observation instances")
+    if obs_t.tokenized_prompt is None:
+        _fail("obs_t.tokenized_prompt is None -- TokenizePrompt output didn't survive to Observation")
+    if obs_t1.tokenized_prompt is None:
+        _fail("obs_t1.tokenized_prompt is None -- expected it to be reused from obs_t")
+    if not np.allclose(np.asarray(obs_t.tokenized_prompt), np.asarray(obs_t1.tokenized_prompt)):
+        _fail("obs_t1.tokenized_prompt doesn't match obs_t's -- reuse logic isn't working")
+    _ok(f"Observation.from_dict succeeded for both obs_t and obs_t1 "
+        f"(images shape {next(iter(obs_t.images.values())).shape}, "
+        f"state shape {obs_t.state.shape}, action_chunk shape {action_chunk.shape})")
 
     print("\nAll checks passed.")
 

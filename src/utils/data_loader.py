@@ -2,36 +2,38 @@
 (obs_t, action_chunk, obs_t1) transitions for the JEPA + OpenPI BC train_step
 in train_step_transitions.py.
 
-MEMORY DESIGN (v2 of this file): this is an IterableDataset that shuffles at
-the EPISODE level and streams frames within each episode lazily, rather than
-a map-style Dataset backed by a global per-frame index array. A prior version
-did `np.arange(len(dataset))` + `np.setdiff1d(...)` to filter out
-last-frame-of-episode indices -- for a dataset with tens/hundreds of millions
-of frames that's real, avoidable memory, since it's proportional to frame
-count. Episode metadata (a handful of ints per episode) is orders of
-magnitude smaller than frame-level metadata, so indexing by episode instead
-of by frame is what actually fixes the scaling, not just a smaller constant.
+REWRITE (v3): the previous raw_batch_to_transition was a hand-fabricated
+Observation construction that got two things wrong (guessed field name
+`prompt_tokens` instead of the real `tokenized_prompt`/`tokenized_prompt_mask`,
+and applied "transforms" at the batch level when openpi's DataTransformFn
+contract is explicitly per-UNBATCHED-sample). This version:
+  1. Applies the REAL transform pipeline (config.data.create(...)'s
+     repack_transforms -> data_transforms -> Normalize -> model_transforms)
+     per-sample inside _get_transition, matching the documented contract.
+  2. Uses Observation.from_dict(...) -- the actual intended construction path
+     confirmed from model.py -- instead of hand-mapping dict keys to kwargs.
+  3. Does NOT reimplement KoboInputs (camera remapping to the canonical
+     base_0_rgb/left_wrist_0_rgb/right_wrist_0_rgb keys, image_mask
+     generation for missing cameras) -- config.data.create(...) already
+     returns a fully-built data_transforms Group containing a real,
+     correctly-configured KoboInputs instance; this file just calls it.
 
-The underlying `LeRobotDataset` itself is not the source of the RAM concern:
-LeRobot v3's tabular data is Arrow/Parquet, accessed memory-mapped, and video
-frames are decoded on-demand by seeking to a timestamp rather than decoding
-the whole file upfront (that's the documented point of the v3 format). This
-file's job is just to not undo that by building its own O(num_frames)
-in-memory structure on top.
-
-WHAT IS CONFIRMED vs. ASSUMED -- same caveats as before, plus:
-- ASSUMED: a lightweight metadata-only class (`LeRobotDatasetMetadata` or
-  similar) exists in your lerobot version for reading fps/camera_keys/episode
-  ranges without constructing a full LeRobotDataset. I couldn't confirm the
-  exact class name for v3 from what I could fetch. There's a fallback that
-  constructs a full LeRobotDataset just to read `.meta` if the lightweight
-  class isn't importable -- correct, but heavier than necessary. If you find
-  the exact lightweight class in your installed version, swap it in.
-- If RAM still looks wrong after this change, the next thing to check is
-  whether your specific installed lerobot version's LeRobotDataset.__init__
-  eagerly materializes something it document says is lazy (pre-release v3
-  builds have had bugs like this) -- worth a `tracemalloc`/`memory_profiler`
-  pass rather than guessing further from here.
+STILL INFERRED, NOT CONFIRMED (no access to data_loader.py):
+  - Pipeline ordering: repack -> data_transforms -> Normalize -> model_transforms.
+    Justification: Normalize's norm_stats are keyed on the data-native (pre-
+    padding) dimensionality, and PadStatesAndActions (a model_transform) pads
+    state/actions to model_action_dim -- if Normalize ran after padding,
+    `stats.mean[..., :x.shape[-1]]` would slice past what the stats actually
+    have. Normalize-before-model_transforms is the only ordering consistent
+    with that.
+  - Prompt injection: KoboDataConfig's repack_transforms structure does NOT
+    map any key to "prompt" (verified from config.py), so PromptFromLeRobotTask
+    must run somewhere outside what config.data.create() returns. Since we
+    already have the resolved task STRING from the LeRobot item directly
+    (no need for the task_index -> tasks dict lookup PromptFromLeRobotTask
+    does), we inject data["prompt"] = task_string ourselves, timed to land
+    after data_transforms and before model_transforms (InjectDefaultPrompt
+    no-ops if "prompt" already present; TokenizePrompt consumes it next).
 """
 
 import queue
@@ -49,6 +51,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 import openpi.models.model as _model
 import openpi.training.config as _config
+from openpi import transforms as _transforms
 
 
 # --------------------------------------------------------------------------- #
@@ -56,12 +59,11 @@ import openpi.training.config as _config
 # --------------------------------------------------------------------------- #
 
 def _load_meta(repo_id_or_root: str, is_local_root: bool):
-    kwargs = {"root": repo_id_or_root} if is_local_root else {"repo_id": repo_id_or_root}
+    kwargs = {"root": repo_id_or_root, "repo_id": repo_id_or_root} if is_local_root else {"repo_id": repo_id_or_root}
     try:
         from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
         return LeRobotDatasetMetadata(**kwargs)
     except ImportError:
-        # Heavier fallback: builds a full dataset just to read .meta.
         return LeRobotDataset(**kwargs).meta
 
 
@@ -80,10 +82,6 @@ def _camera_keys_from_meta(meta) -> list[str]:
 
 
 def _episode_frame_ranges(meta) -> list[tuple[int, int]]:
-    """Per-episode (from, to) EXCLUSIVE global frame-index ranges. Size is
-    O(num_episodes), not O(num_frames) -- this is the whole point.
-    VERIFY column/attribute names against your installed lerobot version if
-    this raises (see module docstring)."""
     if hasattr(meta, "episodes"):
         try:
             ep_table = meta.episodes
@@ -104,16 +102,41 @@ def _episode_frame_ranges(meta) -> list[tuple[int, int]]:
 
 
 # --------------------------------------------------------------------------- #
-# 2. Episode-shuffled streaming dataset
+# 2. Real openpi transform pipeline, staged so we can inject "prompt" and
+#    swap in a reduced (no-tokenization) model_transforms list for obs_t1.
+# --------------------------------------------------------------------------- #
+
+def _build_transform_stages(config: _config.TrainConfig):
+    data_config = config.data.create(config.assets_dirs, config.model)
+    normalize = _transforms.Normalize(data_config.norm_stats, use_quantiles=data_config.use_quantile_norm)
+
+    pre_prompt = _transforms.compose([*data_config.repack_transforms.inputs, *data_config.data_transforms.inputs])
+    post_prompt_full = _transforms.compose([normalize, *data_config.model_transforms.inputs])
+
+    # obs_t1 (the JEPA target) has no separate prompt/action-chunk target of
+    # its own -- reuse obs_t's tokenized_prompt/mask instead of re-tokenizing,
+    # and skip prompt-dependent transforms entirely for it.
+    reduced_model_transforms = [
+        t for t in data_config.model_transforms.inputs
+        if not isinstance(t, (_transforms.TokenizePrompt, _transforms.TokenizeFASTInputs, _transforms.InjectDefaultPrompt))
+    ]
+    post_prompt_reduced = _transforms.compose([normalize, *reduced_model_transforms])
+
+    return data_config, pre_prompt, post_prompt_full, post_prompt_reduced
+
+
+# --------------------------------------------------------------------------- #
+# 3. Episode-shuffled streaming dataset
 # --------------------------------------------------------------------------- #
 
 class LeRobotV3TransitionIterableDataset(IterableDataset):
-    """Streams (obs_t, action_chunk, obs_t1) raw dict samples, shuffled at
+    """Streams (obs_t, obs_t1) raw-but-transformed dict samples, shuffled at
     the episode level, filtering out each episode's last frame (no valid t+1
     there). Memory footprint is O(num_episodes), not O(num_frames)."""
 
     def __init__(
         self,
+        config: _config.TrainConfig,
         repo_id_or_root: str,
         action_horizon: int,
         camera_keys: Optional[list[str]] = None,
@@ -121,6 +144,7 @@ class LeRobotV3TransitionIterableDataset(IterableDataset):
         shuffle_episodes: bool = True,
         seed: int = 0,
     ):
+        self.config = config
         self.repo_id_or_root = repo_id_or_root
         self.action_horizon = action_horizon
         self.is_local_root = is_local_root
@@ -130,15 +154,19 @@ class LeRobotV3TransitionIterableDataset(IterableDataset):
         meta = _load_meta(repo_id_or_root, is_local_root)
         self.fps = meta.fps
         self.camera_keys = camera_keys or _camera_keys_from_meta(meta)
-        self.episode_ranges = _episode_frame_ranges(meta)  # O(num_episodes)
+        self.episode_ranges = _episode_frame_ranges(meta)
         self.num_episodes = len(self.episode_ranges)
-        # cheap: sum over a num_episodes-length list, not a per-frame array
         self.total_frames = int(sum(to - frm for frm, to in self.episode_ranges))
         self.approx_valid_samples = max(0, self.total_frames - self.num_episodes)
 
+        # Transform pipeline construction is cheap (Python objects + one
+        # norm_stats JSON read via config.data.create), unlike the heavy
+        # LeRobotDataset build -- build it once here rather than per-worker.
+        self.data_config, self._pre_prompt, self._post_prompt_full, self._post_prompt_reduced = (
+            _build_transform_stages(config)
+        )
+
     def __len__(self):
-        # Approximate (excludes empty/1-frame episodes edge cases) -- for
-        # logging/progress-bar purposes only, not used for indexing.
         return self.approx_valid_samples
 
     def _build_dataset(self) -> LeRobotDataset:
@@ -149,7 +177,7 @@ class LeRobotV3TransitionIterableDataset(IterableDataset):
         }
         for cam in self.camera_keys:
             delta_timestamps[cam] = [0.0, step]
-        kwargs = {"root": self.repo_id_or_root} if self.is_local_root else {"repo_id": self.repo_id_or_root}
+        kwargs = {"root": self.repo_id_or_root, "repo_id": self.repo_id_or_root} if self.is_local_root else {"repo_id": self.repo_id_or_root}
         return LeRobotDataset(delta_timestamps=delta_timestamps, **kwargs)
 
     def __iter__(self) -> Iterator[dict]:
@@ -157,14 +185,6 @@ class LeRobotV3TransitionIterableDataset(IterableDataset):
         worker_id = worker_info.id if worker_info is not None else 0
         num_workers = worker_info.num_workers if worker_info is not None else 1
 
-        # __iter__ is called once per EPOCH (PyTorch re-invokes iter(dataset)
-        # at every epoch boundary even with persistent_workers=True), so
-        # rebuilding the full LeRobotDataset here every time would silently
-        # undo the point of the lightweight-metadata split above -- the heavy
-        # construction (not just the metadata probe) would repeat every
-        # epoch. Cache it on self instead: persistent worker processes keep
-        # their copy of self alive across epochs, so this is a true
-        # once-per-worker-process cost, not once-per-epoch.
         if getattr(self, "_cached_dataset", None) is None:
             self._cached_dataset = self._build_dataset()
         dataset = self._cached_dataset
@@ -173,14 +193,13 @@ class LeRobotV3TransitionIterableDataset(IterableDataset):
         episode_order = np.arange(self.num_episodes)
         if self.shuffle_episodes:
             rng.shuffle(episode_order)
-        # shard episodes across workers so they don't duplicate work
         episode_order = episode_order[worker_id::num_workers]
 
         for ep_i in episode_order:
             frm, to = self.episode_ranges[int(ep_i)]
             if to - frm < 2:
-                continue  # no valid t -> t+1 pair possible in a 0/1-frame episode
-            local_indices = np.arange(frm, to - 1)  # exclude last frame
+                continue
+            local_indices = np.arange(frm, to - 1)
             if self.shuffle_episodes:
                 rng.shuffle(local_indices)
             for global_idx in local_indices:
@@ -189,82 +208,119 @@ class LeRobotV3TransitionIterableDataset(IterableDataset):
     def _get_transition(self, dataset: LeRobotDataset, real_idx: int) -> dict:
         item = dataset[real_idx]
 
-        images_t, images_t1 = {}, {}
+        # Raw per-camera frames, keyed by the ACTUAL LeRobot column names
+        # (e.g. "observation.images.cam1") -- these are exactly the strings
+        # KoboDataConfig's repack_transforms.structure looks up.
+        imgs_t, imgs_t1 = {}, {}
         for cam in self.camera_keys:
-            imgs = np.asarray(item[cam])  # expected [2, ...] from delta_timestamps
+            imgs = np.asarray(item[cam])
             if imgs.shape[0] != 2:
                 raise RuntimeError(
                     f"Expected 2 timesteps (t, t+1) for '{cam}', got shape {imgs.shape}. "
                     "Check delta_timestamps handling for your lerobot version."
                 )
             frame_t, frame_t1 = imgs[0], imgs[1]
-            for frame, dest in ((frame_t, images_t), (frame_t1, images_t1)):
+            for frame, dest in ((frame_t, imgs_t), (frame_t1, imgs_t1)):
                 if frame.ndim == 3 and frame.shape[0] in (1, 3) and frame.shape[0] != frame.shape[-1]:
                     frame = np.transpose(frame, (1, 2, 0))
                 if np.issubdtype(frame.dtype, np.floating):
+                    # Observation.from_dict expects uint8 (it does the ->[-1,1]
+                    # conversion itself); keep raw dtype through the pipeline.
                     frame = (255 * frame).astype(np.uint8)
                 dest[cam] = frame
 
         state = np.asarray(item["observation.state"])
-        state_t, state_t1 = state[0], state[1]
+        state_t, state_t1 = state[0].astype(np.float32), state[1].astype(np.float32)
         action = np.asarray(item["action"], dtype=np.float32)
         task = item.get("task", "")
+        if not isinstance(task, str):
+            task = str(task)
 
-        return {
-            "images": images_t,
-            "state": state_t.astype(np.float32),
-            "action": action,
-            "next_images": images_t1,
-            "next_state": state_t1.astype(np.float32),
-            "task": task,
-        }
+        # --- obs_t: full pipeline, real action chunk, real prompt ---------- #
+        raw_t = {**imgs_t, "observation.state": state_t, "action": action}
+        data_t = self._pre_prompt(dict(raw_t))
+        if "prompt" not in data_t:
+            data_t["prompt"] = task
+        data_t = self._post_prompt_full(data_t)
+        self._ensure_image_mask(data_t)
+
+        # --- obs_t1: reduced pipeline, dummy action (discarded), no tokenization --- #
+        # RepackTransform's structure unconditionally looks up "action" via
+        # its configured key, so a placeholder is required even though we
+        # never use obs_t1's "actions" output downstream.
+        raw_t1 = {**imgs_t1, "observation.state": state_t1, "action": np.zeros_like(action)}
+        data_t1 = self._pre_prompt(dict(raw_t1))
+        data_t1 = self._post_prompt_reduced(data_t1)
+        self._ensure_image_mask(data_t1)
+
+        return {"obs_t": data_t, "obs_t1": data_t1}
+
+    @staticmethod
+    def _ensure_image_mask(data: dict) -> None:
+        """image_masks is a REQUIRED field on Observation (no default) --
+        if KoboInputs doesn't produce "image_mask" for some reason, fail
+        loudly rather than let Observation.from_dict KeyError somewhere
+        less obvious, and offer an explicit escape hatch (all-valid mask)
+        only if the caller explicitly wants that fallback behavior."""
+        if "image_mask" not in data:
+            raise RuntimeError(
+                "Transformed sample is missing 'image_mask' -- expected KoboInputs (data_transforms) "
+                "to produce it (see model.py's IMAGE_KEYS / image_mask contract). If your data_transforms "
+                "genuinely don't produce this, add an explicit fallback here rather than silently "
+                "assuming all-valid masks."
+            )
 
 
-def _collate(batch: list[dict]) -> dict:
+def _stack_dicts(items: list[dict]) -> dict:
+    """Recursively stack a list of (possibly nested) per-sample dicts into
+    batched arrays, preserving dict structure (needed for the "image"/
+    "image_mask" sub-dicts keyed by camera name)."""
     out = {}
-    cams = batch[0]["images"].keys()
-    out["images"] = {cam: np.stack([b["images"][cam] for b in batch]) for cam in cams}
-    out["next_images"] = {cam: np.stack([b["next_images"][cam] for b in batch]) for cam in cams}
-    out["state"] = np.stack([b["state"] for b in batch])
-    out["next_state"] = np.stack([b["next_state"] for b in batch])
-    out["action"] = np.stack([b["action"] for b in batch])
-    out["task"] = [b["task"] for b in batch]
+    for k in items[0].keys():
+        v0 = items[0][k]
+        if isinstance(v0, dict):
+            out[k] = _stack_dicts([it[k] for it in items])
+        elif isinstance(v0, str):
+            out[k] = [it[k] for it in items]
+        else:
+            out[k] = np.stack([np.asarray(it[k]) for it in items])
     return out
 
 
+def _collate(batch: list[dict]) -> dict:
+    return {
+        "obs_t": _stack_dicts([b["obs_t"] for b in batch]),
+        "obs_t1": _stack_dicts([b["obs_t1"] for b in batch]),
+    }
+
+
 # --------------------------------------------------------------------------- #
-# 3. ADAPT THIS: raw dict -> (Observation, Actions, Observation)
+# 4. Batch dict -> (Observation, Actions, Observation)
 # --------------------------------------------------------------------------- #
 
 def raw_batch_to_transition(raw: dict, config: _config.TrainConfig) -> tuple[_model.Observation, jnp.ndarray, _model.Observation]:
-    """Convert a raw collated batch into (obs_t, action_chunk, obs_t1).
+    """Both obs_t and obs_t1 dicts are already in exactly the shape
+    Observation.from_dict expects (that's what the real transform pipeline
+    produces) -- no manual field-by-field construction needed anymore."""
+    obs_t_dict = jax.tree.map(lambda x: x, raw["obs_t"])  # shallow copy, avoid mutating raw
+    obs_t = _model.Observation.from_dict(obs_t_dict)
 
-    ADAPT THIS FUNCTION to your actual pipeline -- see prior notes. This does
-    the minimal best-guess version instead of your real data_transforms/
-    model_transforms (normalization stats, tokenizer). Wherever your existing
-    `_data_loader.create_data_loader` builds an Observation from a similar
-    dict, call that same path here for obs_t, and reuse its prompt_tokens for
-    obs_t1 rather than duplicating logic.
-    """
-    def _images_to_jax(images: dict) -> dict:
-        return {cam: jnp.asarray(arr.astype(np.float32) / 255.0) for cam, arr in images.items()}
+    obs_t1_dict = dict(raw["obs_t1"])
+    # Reuse obs_t's tokenized prompt for obs_t1 (same episode/task) instead
+    # of leaving it unset -- from_dict requires tokenized_prompt and
+    # tokenized_prompt_mask to be provided together, and our reduced
+    # pipeline deliberately produced neither for obs_t1.
+    if obs_t.tokenized_prompt is not None:
+        obs_t1_dict["tokenized_prompt"] = np.asarray(obs_t.tokenized_prompt)
+        obs_t1_dict["tokenized_prompt_mask"] = np.asarray(obs_t.tokenized_prompt_mask)
+    obs_t1 = _model.Observation.from_dict(obs_t1_dict)
 
-    obs_t = _model.Observation(
-        images=_images_to_jax(raw["images"]),
-        state=jnp.asarray(raw["state"]),
-        prompt_tokens=None,  # ADAPT: tokenize raw["task"] with your model's tokenizer
-    )
-    obs_t1 = _model.Observation(
-        images=_images_to_jax(raw["next_images"]),
-        state=jnp.asarray(raw["next_state"]),
-        prompt_tokens=obs_t.prompt_tokens,  # reuse -- same episode/task
-    )
-    action_chunk = jnp.asarray(raw["action"])
+    action_chunk = jnp.asarray(raw["obs_t"]["actions"])
     return obs_t, action_chunk, obs_t1
 
 
 # --------------------------------------------------------------------------- #
-# 4. JAX-facing infinite iterator with background prefetch + sharding
+# 5. JAX-facing infinite iterator with background prefetch + sharding
 # --------------------------------------------------------------------------- #
 
 class JepaTransitionDataLoader:
@@ -284,12 +340,9 @@ class JepaTransitionDataLoader:
         self.config = config
         self.data_sharding = data_sharding
         dataset = LeRobotV3TransitionIterableDataset(
-            repo_id_or_root, action_horizon, camera_keys=camera_keys,
+            config, repo_id_or_root, action_horizon, camera_keys=camera_keys,
             is_local_root=is_local_root, shuffle_episodes=True, seed=seed,
         )
-        # NOTE: no shuffle= kwarg here -- IterableDataset shuffles itself
-        # (at the episode level, inside __iter__); torch.utils.data.DataLoader
-        # disallows shuffle=True combined with an IterableDataset.
         self._torch_loader = TorchDataLoader(
             dataset,
             batch_size=batch_size,
@@ -314,13 +367,7 @@ class JepaTransitionDataLoader:
                     action_chunk = jax.device_put(action_chunk, self.data_sharding)
                     obs_t1 = jax.device_put(obs_t1, self.data_sharding)
                     self._queue.put((obs_t, action_chunk, obs_t1))
-        except Exception as e:  # noqa: BLE001 -- deliberately broad: forward *any* failure
-            # Without this, an exception here (bad frame, decode error, OOM,
-            # etc.) just kills this daemon thread silently -- the main loop's
-            # queue.get() then blocks forever with no error, no traceback
-            # anywhere obvious, and no indication training has actually
-            # stopped making progress. Put it on the queue instead so the
-            # consumer sees the failure the next time it asks for a batch.
+        except Exception as e:  # noqa: BLE001
             self._queue.put(e)
 
     def __iter__(self) -> Iterator[tuple[_model.Observation, jnp.ndarray, _model.Observation]]:

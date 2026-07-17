@@ -173,10 +173,64 @@ def convert(model, torch_state: dict, dry_run: bool):
     return new_model
 
 
+def save_converted_state(model, path: str):
+    """Save a converted (pretrained-weights-loaded) predictor's params to disk
+    as a flat .npz, for later use by load_and_merge_predictor_state(). This
+    was missing before -- convert() built the loaded model in memory but
+    nothing ever persisted it, so init_train_state had no way to pick it up."""
+    flat = flatten_nnx_state(model)
+    # '.' -> '__' because npz member names are written as f"{key}.npy" internally;
+    # dots in the key make that ambiguous with the extension.
+    np.savez(path, **{k.replace(".", "__"): np.asarray(v) for k, v in flat.items()})
+    print(f"Saved converted predictor state to {path} ({len(flat)} arrays)")
+
+
+def load_and_merge_predictor_state(full_model, npz_path: str):
+    """Load a .npz produced by save_converted_state() and merge it into
+    `full_model.jepa_predictor` in place (full_model is expected to be an
+    OpenPIWithJEPA instance, not a standalone predictor -- paths get prefixed
+    with 'jepa_predictor.' accordingly). Returns the merged model.
+    Call this from init_train_state() after constructing OpenPIWithJEPA and
+    before extracting final params, if config.jepa_predictor_checkpoint is set.
+    """
+    npz = np.load(npz_path)
+    flat = {k.replace("__", "."): v for k, v in npz.items()}
+
+    graphdef, state = nnx.split(full_model)
+    pure = state.to_pure_dict()
+
+    def _set(d, path_str, value):
+        parts = path_str.split(".")
+        for p in parts[:-1]:
+            d = d[p] if p in d else d[int(p)]
+        leaf_key = parts[-1]
+        target = d[leaf_key] if leaf_key in d else d[int(leaf_key)]
+        target.value = jnp.asarray(value)
+
+    missing = []
+    for k, v in flat.items():
+        try:
+            _set(pure, f"jepa_predictor.{k}", v)
+        except (KeyError, IndexError):
+            missing.append(k)
+    if missing:
+        raise RuntimeError(
+            f"{len(missing)} keys from {npz_path} did not map onto full_model.jepa_predictor "
+            f"(e.g. {missing[:5]}). This usually means the predictor config used when building "
+            f"full_model doesn't match the one used during conversion."
+        )
+    print(f"Merged {len(flat)} converted predictor params into full_model.jepa_predictor.")
+    return nnx.merge(graphdef, pure)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", required=True, help="Path to vjepa2-ac-*.pt")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--save-path", type=str, default=None,
+                         help="Where to write the converted predictor state (.npz). "
+                              "Required unless --dry-run. Load it back via "
+                              "load_and_merge_predictor_state() in init_train_state.")
     # Model config must match the checkpoint's architecture (defaults below
     # match the ViT-g/16 predictor per the paper: depth=24, num_heads=16,
     # predictor_embed_dim=1024). Adjust for other checkpoint variants.
@@ -204,4 +258,8 @@ if __name__ == "__main__":
     )
 
     torch_state = load_pytorch_predictor_state(args.ckpt)
-    convert(model, torch_state, dry_run=args.dry_run)
+    converted = convert(model, torch_state, dry_run=args.dry_run)
+    if not args.dry_run:
+        if not args.save_path:
+            raise ValueError("--save-path is required unless --dry-run is set.")
+        save_converted_state(converted, args.save_path)

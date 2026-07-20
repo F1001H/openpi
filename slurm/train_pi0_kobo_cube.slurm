@@ -1,13 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=pi0_kobo_cube
-#SBATCH --partition=<PARTITION>          # TODO: fill in from `sinfo` / your allocation docs
-#SBATCH --account=<ACCOUNT>              # TODO: your project/account on hessianAI 43
-#SBATCH --gres=gpu:1                     # 1 node, 1 GPU (adjust if the cluster uses --gpus=1 instead)
-#SBATCH --cpus-per-task=16               # TODO: match to the data-loader's num_workers + headroom
-#SBATCH --mem=128G                       # TODO: adjust to what a node/GPU-share actually gives you
-#SBATCH --time=48:00:00                  # TODO: 30k steps at low_mem's local ~1.4 it/s would be
-                                          #       ~6h; full (non-LoRA) pi0_kobo_cube is heavier per
-                                          #       step -- pad generously, especially for the first run
+#SBATCH --partition=all                  
+#SBATCH --account=cm74paso
+#SBATCH --gres=gpu:h100:1                # cn01's Gres=gpu:h100:8 confirms the GRES name is "h100"
+#SBATCH --cpus-per-task=14               # 112 CPUs / 8 GPUs per node (cn01) -- proportional 1-GPU share
+#SBATCH --mem=128G
 #SBATCH --output=slurm/logs/%x-%j.out
 #SBATCH --error=slurm/logs/%x-%j.out
 
@@ -23,9 +20,9 @@ REPO_DIR="${REPO_DIR:-$HOME/openpi}"
 # team-confirmed convention -- confirm/adjust with the team, and if someone's
 # already put these there, just point at the real paths.
 SHARED_WS="/mnt/vast/workspaces/VLA_Reinforcement"
-DATASET_ROOT="${DATASET_ROOT:-$SHARED_WS/datasets/kobo_cube}"
-JEPA_PT_CKPT="${JEPA_PT_CKPT:-$SHARED_WS/pretrained/vjepa2-ac-vitg.pt}"
-JEPA_NPZ_CKPT="${JEPA_NPZ_CKPT:-$SHARED_WS/pretrained/jepa_predictor/vjepa2_ac_converted.npz}"
+DATASET_ROOT="${DATASET_ROOT:-$SHARED_WS/fabian/kobo_cube}"
+JEPA_PT_CKPT="${JEPA_PT_CKPT:-$SHARED_WS/fabian/vjepa2-ac-vitg.pt}"
+JEPA_NPZ_CKPT="${JEPA_NPZ_CKPT:-$SHARED_WS/fabian/jepa_predictor/vjepa2_ac_converted.npz}"
 
 # Shared team workspace (10TB) vs. personal workspace (200GB per person) -- per
 # team convention, cached pretrained models/datasets go in the shared
@@ -94,6 +91,7 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train_end_to_end.py \
     --exp-name="$EXP_NAME" \
     --resume \
     --data.root="$DATASET_ROOT" \
-    --jepa-predictor-checkpoint "$JEPA_NPZ_CKPT"
+    --jepa-predictor-checkpoint "$JEPA_NPZ_CKPT" \
+    --num-train-steps=100 \
 
 echo "Done. Checkpoints under checkpoints/$CONFIG_NAME/$EXP_NAME/"

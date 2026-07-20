@@ -1,7 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=pi0_kobo_cube
-#SBATCH --partition=all                  
-#SBATCH --account=cm74paso
+#SBATCH --partition=all
+# --account removed: cm74paso is Fabian's login username, not necessarily a
+# valid SLURM account/project name -- omitting it lets SLURM use the default
+# association for the user. If sbatch complains about a missing/required
+# account, run `sacctmgr show associations user=$USER` to find the real name.
 #SBATCH --gres=gpu:h100:1                # cn01's Gres=gpu:h100:8 confirms the GRES name is "h100"
 #SBATCH --cpus-per-task=14               # 112 CPUs / 8 GPUs per node (cn01) -- proportional 1-GPU share
 #SBATCH --mem=128G
@@ -78,7 +81,7 @@ fi
 
 # --- 3. wandb -- set WANDB_API_KEY in your shell env or ~/.netrc before submitting, or ---- #
 #        export WANDB_MODE=offline / pass --no-wandb-enabled below to disable it entirely.
-export WANDB_MODE="${WANDB_MODE:-online}"
+export WANDB_MODE="${WANDB_MODE:-offline}"
 
 # --- 4. Train ----------------------------------------------------------------------------- #
 # pi0_kobo_cube is the FULL (non-LoRA) fine-tune. Locally, adding the ViT-g

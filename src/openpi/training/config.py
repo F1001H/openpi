@@ -1072,9 +1072,12 @@ _CONFIGS = [
         data=KoboDataConfig(
             repo_id="local/bimanual_cube",
             use_delta_actions=False, # Transforms workspace spatial positions into relative displacement vectors
+            # root must be set here (not on base_config) -- create_base_config()
+            # unconditionally overwrites base_config.root with self.root, so a
+            # base_config=DataConfig(root=...) value is silently discarded.
+            root=pathlib.Path("/home/fabian/kobo_cube"),  # Native dataset v3 target path
             base_config=DataConfig(
                 prompt_from_task=True,
-                root=pathlib.Path("/home/fabian/lev3_dataset_cube_task_space"),  # Native dataset v3 target path
             ),
         ),
         # Initialize weights from the standardized upstream base parameters
@@ -1094,7 +1097,7 @@ _CONFIGS = [
         data=KoboDataConfig(
             repo_id="local/bimanual_cube",
             use_delta_actions=False,
-            root=pathlib.Path("/home/fabian/lev3_dataset_cube_task_space_orange_external_gripper_shifted"),
+            root=pathlib.Path("/home/fabian/kobo_cube"),
             # Add the literal text string directly here!
             default_prompt="pick up the orange cube and place it on the red tape",
             base_config=DataConfig(
@@ -1117,7 +1120,15 @@ _CONFIGS = [
             decay_steps=1_000_000,
             decay_lr=5e-5,
         ),
-        ema_decay=None,
+        # NOTE: other LoRA configs in this file set ema_decay=None ("Turn off
+        # EMA for LoRA finetuning") since EMA there only smooths the final
+        # inference checkpoint. Here it does double duty: train_step_transitions
+        # ._get_teacher_model() also uses state.ema_params (when present) as the
+        # JEPA target-branch teacher, falling back to the *same-step* online
+        # params (just stop-gradiented) when ema_decay is None -- i.e. no time
+        # lag between the online/target branches, which is a known collapse
+        # risk for joint-embedding methods. 0.999 matches pi05_libero's value.
+        ema_decay=0.999,
         num_train_steps=30_000,
         batch_size=32,
     ),

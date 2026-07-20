@@ -1,3 +1,4 @@
+import functools
 import math
 from typing import Optional
 
@@ -6,8 +7,23 @@ import jax.numpy as jnp
 from flax import nnx
 
 
+@functools.lru_cache(maxsize=None)
 def trunc_normal_init(std: float = 0.02):
-    """Equivalent to torch's trunc_normal_(std=std) used in _init_weights."""
+    """Equivalent to torch's trunc_normal_(std=std) used in _init_weights.
+
+    Cached so repeated calls with the same std return the SAME function
+    object. jax.nn.initializers.truncated_normal(...) builds a fresh closure
+    on every call; using it directly as a per-construction kernel_init means
+    two independent model constructions (e.g. the jax.eval_shape shape-
+    inference pass and the real jax.jit pass in init_train_state) produce
+    NodeDef.static_fields with non-identical (non-`==`) kernel_init closures,
+    making their nnx.graphdef()s compare unequal even though the models are
+    architecturally identical -- which breaks jax.jit's out_shardings
+    pytree-structure check ("different pytree metadata at key path
+    pjit out_shardings.model_def"). Caching keeps the closure identical
+    across constructions with the same std, matching how nnx.Linear's own
+    default kernel_init (a single shared module-level function) behaves.
+    """
     return jax.nn.initializers.truncated_normal(stddev=std)
 
 
@@ -46,9 +62,9 @@ def build_3d_rope_coords(T: int, H: int, W: int, action_tokens: int) -> tuple[jn
     "temporal-only RoPE for action/pose tokens" description.
     """
     frame_len = action_tokens + H * W
-    t_patch, h_patch, w_patch = jnp.meshgrid(
-        jnp.arange(H), jnp.arange(W), indexing="ij"
-    )
+    # T is handled by the per-t loop below, not by meshgrid -- only H/W form
+    # a 2D per-frame grid here, so meshgrid takes/returns 2 arrays, not 3.
+    h_patch, w_patch = jnp.meshgrid(jnp.arange(H), jnp.arange(W), indexing="ij")
     h_patch = h_patch.reshape(-1)  # [H*W]
     w_patch = w_patch.reshape(-1)  # [H*W]
 

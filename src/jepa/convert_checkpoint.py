@@ -162,8 +162,14 @@ def convert(model, torch_state: dict, dry_run: bool):
         for p in parts[:-1]:
             d = d[p] if p in d else d[int(p)]
         leaf_key = parts[-1]
-        target = d[leaf_key] if leaf_key in d else d[int(leaf_key)]
-        target.value = jnp.asarray(value)
+        # `d` comes from state.to_pure_dict(), whose leaves are raw arrays,
+        # not nnx.Variable -- so this must be a dict-item reassignment, not
+        # a `.value =` mutation (there is no real `.value` slot on a plain
+        # array/tracer; setting one is either a silent no-op attribute hang
+        # on an eager ArrayImpl, or a hard AttributeError under jax.jit/
+        # eval_shape tracing).
+        key = leaf_key if leaf_key in d else int(leaf_key)
+        d[key] = jnp.asarray(value)
 
     for target_path, (arr, _src) in mapped.items():
         _set(pure, target_path, arr)
@@ -204,8 +210,14 @@ def load_and_merge_predictor_state(full_model, npz_path: str):
         for p in parts[:-1]:
             d = d[p] if p in d else d[int(p)]
         leaf_key = parts[-1]
-        target = d[leaf_key] if leaf_key in d else d[int(leaf_key)]
-        target.value = jnp.asarray(value)
+        # `d` comes from state.to_pure_dict(), whose leaves are raw arrays,
+        # not nnx.Variable -- so this must be a dict-item reassignment, not
+        # a `.value =` mutation (there is no real `.value` slot on a plain
+        # array/tracer; setting one is either a silent no-op attribute hang
+        # on an eager ArrayImpl, or a hard AttributeError under jax.jit/
+        # eval_shape tracing).
+        key = leaf_key if leaf_key in d else int(leaf_key)
+        d[key] = jnp.asarray(value)
 
     missing = []
     for k, v in flat.items():

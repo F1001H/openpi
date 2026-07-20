@@ -343,6 +343,13 @@ class JepaTransitionDataLoader:
             config, repo_id_or_root, action_horizon, camera_keys=camera_keys,
             is_local_root=is_local_root, shuffle_episodes=True, seed=seed,
         )
+        # LeRobotV3TransitionIterableDataset already built the real DataConfig
+        # (via config.data.create(...), see _build_transform_stages) to derive
+        # its transform pipeline -- reuse it here rather than rebuilding, so
+        # data_config() (required by the openpi.training.data_loader.DataLoader
+        # Protocol that checkpoints.save_state's save_assets callback expects)
+        # returns the exact same norm_stats/asset_id the transforms were built from.
+        self._data_config = dataset.data_config
         self._torch_loader = TorchDataLoader(
             dataset,
             batch_size=batch_size,
@@ -369,6 +376,9 @@ class JepaTransitionDataLoader:
                     self._queue.put((obs_t, action_chunk, obs_t1))
         except Exception as e:  # noqa: BLE001
             self._queue.put(e)
+
+    def data_config(self) -> _config.DataConfig:
+        return self._data_config
 
     def __iter__(self) -> Iterator[tuple[_model.Observation, jnp.ndarray, _model.Observation]]:
         while True:

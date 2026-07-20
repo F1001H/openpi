@@ -58,6 +58,7 @@ import optax
 import tqdm_loggable.auto as tqdm
 import wandb
 
+import openpi.models.gemma as _gemma
 import openpi.models.model as _model
 import openpi.shared.array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
@@ -77,6 +78,23 @@ from jepa.ac_predictor_nnx import VisionTransformerPredictorAC
 # 1. MODEL WRAPPER
 # =========================================================================== #
 
+# Pi0's PaliGemma.img(...) (pi0.py) builds SigLIP with num_classes=
+# paligemma_config.width -- i.e. its output head already projects vision
+# patch tokens into the Gemma LLM's embedding width (2048 for gemma_2b/
+# gemma_2b_lora, NOT SigLIP's own internal width of 1152), so that image
+# tokens and language tokens can be concatenated for the VLM prefix. That
+# width does not match the 1408 the pretrained V-JEPA2-AC predictor's
+# context input expects (that's ViT-g, V-JEPA2's own separate image
+# encoder -- we've only converted its predictor, not its encoder).
+# vision_proj bridges the two. This is only architecturally sound because
+# JEPA and BC are co-trained end-to-end here: the projection (and the
+# predictor itself) adapt to Pi0's actual feature distribution during
+# training, rather than needing to already match a frozen predictor's
+# pretraining distribution.
+def _pi0_vision_width(model_config: _model.BaseModelConfig) -> int:
+    return _gemma.get_config(model_config.paligemma_variant).width
+
+
 class OpenPIWithJEPA(nnx.Module):
     """Wraps the base OpenPI model and registers the Action-Conditioned JEPA
     predictor as an NNX submodule, for single-step transition prediction."""
@@ -84,16 +102,24 @@ class OpenPIWithJEPA(nnx.Module):
     def __init__(self, base_model: _model.BaseModel, config: _config.TrainConfig, rngs: nnx.Rngs):
         self.base_model = base_model
 
-        img_size = getattr(config, "img_size", (224, 224))
+        # Defaults below match the pretrained V-JEPA2-AC ViT-g/16 predictor
+        # checkpoint (see convert_checkpoint.py's --embed-dim/--num-frames/etc
+        # CLI defaults) -- they must stay in sync with whatever architecture
+        # convert_checkpoint.py was run with, or load_and_merge_predictor_state
+        # will fail to map keys. TrainConfig has no fields for these; override
+        # via getattr only if you add matching fields to TrainConfig.
+        img_size = getattr(config, "img_size", (256, 256))
         patch_size = getattr(config, "patch_size", 16)
         # Single-step transitions -> single-frame context. If you later move
         # to true multi-frame video JEPA, these become >1 and the batch/data
         # loader need to supply frame histories instead of single transitions.
-        num_frames = getattr(config, "num_frames", 1)
-        tubelet_size = getattr(config, "tubelet_size", 1)
-        embed_dim = getattr(config, "embed_dim", 768)
+        num_frames = getattr(config, "num_frames", 8)
+        tubelet_size = getattr(config, "tubelet_size", 2)
+        embed_dim = getattr(config, "embed_dim", 1408)
         predictor_embed_dim = getattr(config, "predictor_embed_dim", 1024)
-        action_dim = getattr(config, "action_dim", 14)
+        # Action encoder's input dim -- must match the checkpoint's pretrained
+        # action_encoder weight shape (7), not this project's own action_dim.
+        action_dim = getattr(config, "action_dim", 7)
 
         self.jepa_predictor = VisionTransformerPredictorAC(
             img_size=img_size,
@@ -106,6 +132,17 @@ class OpenPIWithJEPA(nnx.Module):
             rngs=rngs,
         )
         self.target_norm = nnx.LayerNorm(embed_dim, rngs=rngs)
+        self.vision_proj = nnx.Linear(_pi0_vision_width(config.model), embed_dim, use_bias=True, rngs=rngs)
+        # Same bridging problem as vision_proj, for the predictor's action/
+        # state encoders: they're pretrained with action_embed_dim=7 (the
+        # V-JEPA2-AC checkpoint's own robot's action space), but Pi0 pads
+        # actions/state to config.model.action_dim (32) for its own action
+        # expert. kobo's native action space (see KoboOutputs) doesn't match
+        # V-JEPA2's pretraining robot either, so this is a genuine new space,
+        # not just a reshape -- relying on end-to-end fine-tuning to adapt
+        # it, same as vision_proj.
+        self.action_proj = nnx.Linear(config.model.action_dim, action_dim, use_bias=True, rngs=rngs)
+        self.state_proj = nnx.Linear(config.model.action_dim, action_dim, use_bias=True, rngs=rngs)
 
     def __call__(self, *args, **kwargs):
         return self.base_model(*args, **kwargs)
@@ -114,14 +151,17 @@ class OpenPIWithJEPA(nnx.Module):
         return self.base_model.compute_loss(*args, **kwargs)
 
     def extract_vision_latents(self, obs: _model.Observation) -> jnp.ndarray:
-        if hasattr(self.base_model, "extract_vision_latents"):
-            return self.base_model.extract_vision_latents(obs)
-        elif hasattr(self.base_model, "backbone") and hasattr(self.base_model.backbone, "extract_features"):
-            return self.base_model.backbone.extract_features(obs)
-        else:
-            raise AttributeError(
-                "Base model structure does not expose a recognized method for visual latent token extraction."
-            )
+        """Runs Pi0's own SigLIP tower (the same PaliGemma.img(...) call
+        embed_prefix uses for the BC prefix, see pi0.py) on the primary
+        exterior camera and projects its patch tokens into the JEPA
+        predictor's embedding space via vision_proj. Only the "base_0_rgb"
+        camera is used -- concatenating multiple cameras here would inflate
+        the token count in a way the predictor's forward() would silently
+        misinterpret as multiple time frames (T = N_ctxt // (grid_h*grid_w)),
+        not multiple camera views.
+        """
+        image_tokens, _ = self.base_model.PaliGemma.img(obs.images["base_0_rgb"], train=False)
+        return self.vision_proj(image_tokens)
 
 
 def _get_proprio(obs: _model.Observation) -> jnp.ndarray:
@@ -138,7 +178,17 @@ def _get_proprio(obs: _model.Observation) -> jnp.ndarray:
 def _get_teacher_model(state: training_utils.TrainState):
     """Return a fully stop-gradiented model to use as the JEPA target
     network. Falls back to the online params if no EMA is configured."""
-    teacher_params = state.ema_params if state.ema_params is not None else state.params
+    if state.ema_params is not None:
+        # state.ema_params only covers config.trainable_filter's leaves (see
+        # init_train_state) -- frozen leaves never change during training, so
+        # storing/blending a second full-size copy of them would be pure
+        # waste. Merge the EMA slice back over the always-current frozen
+        # leaves from state.params to get a complete param tree.
+        full_flat = dict(state.params.flat_state())
+        full_flat.update(dict(state.ema_params.flat_state()))
+        teacher_params = nnx.State.from_flat_path(full_flat)
+    else:
+        teacher_params = state.params
     return nnx.merge(state.model_def, jax.lax.stop_gradient(teacher_params))
 
 
@@ -178,8 +228,8 @@ def train_step(
         # --- Task 2: Action-conditioned JEPA transition prediction ---
         # ASSUMPTION (see module docstring point 2): first action in the chunk
         # is the single physical action that produced obs_t -> obs_t1.
-        action_t = action_chunk[:, 0, :]                    # [B, action_dim]
-        proprio_t = _get_proprio(obs_t)                     # [B, action_dim] (or whatever your state dim is)
+        action_t = model_inst.action_proj(action_chunk[:, 0, :])   # [B, action_dim] -> [B, 7]
+        proprio_t = model_inst.state_proj(_get_proprio(obs_t))    # [B, action_dim] -> [B, 7]
 
         z_context = model_inst.extract_vision_latents(obs_t)  # [B, H*W, D] for num_frames=1
 
@@ -214,7 +264,7 @@ def train_step(
         }
 
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads, metrics = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
+    (loss, metrics), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
         model, train_rng, obs_t, action_chunk, obs_t1
     )
 
@@ -228,13 +278,46 @@ def train_step(
     new_state = dataclasses.replace(state, step=state.step + 1, params=new_full_params, opt_state=new_opt_state)
 
     if state.ema_decay is not None and state.ema_params is not None:
+        # state.ema_params only covers config.trainable_filter's leaves (see
+        # init_train_state) -- frozen leaves (the multi-GB Gemma/SigLIP
+        # backbone under LoRA finetuning) never change from nnx.update()
+        # above, so tracking/blending a second full-size copy of them would
+        # be pure waste. That's what OOM'd this LoRA "low_mem" config the
+        # first time EMA was turned on: a full-structure ema_params doubles
+        # resident frozen-param memory, and since it's a separate top-level
+        # jit output from state.params, XLA can't just alias the two even
+        # when the blend is skipped for those leaves -- it has to physically
+        # duplicate the buffer. Keeping ema_params sparse avoids that
+        # entirely; _get_teacher_model() merges it back over state.params.
+        #
+        # nnx.State.map()/jax.tree.map() both operate through the
+        # VariableState wrapper at each leaf (see nnx_utils.state_map's
+        # `p.replace(...)` pattern), so build the blended state via
+        # flat_state() dicts directly rather than a tree_map over a
+        # separately-built boolean mask (which has a mismatched pytree
+        # structure -- raw bools where a VariableState node is expected).
+        new_trainable = new_full_params.filter(config.trainable_filter)
+        old_flat = dict(state.ema_params.flat_state())
+        new_flat = dict(new_trainable.flat_state())
+
+        blended_flat = {}
+        for k, new_vs in new_flat.items():
+            # Non-floating leaves (e.g. nnx.Rngs' RngKey/RngCount state, which
+            # rides along in nnx.state(model) alongside the real Params) can't
+            # be blended -- decay*old + (1-decay)*new is undefined for PRNG
+            # keys/counters, and there's no meaningful "average" of two of
+            # them anyway. Just track the live online value for those.
+            if jnp.issubdtype(jnp.asarray(new_vs.value).dtype, jnp.floating):
+                old_vs = old_flat[k]
+                blended_flat[k] = new_vs.replace(
+                    state.ema_decay * old_vs.value + (1.0 - state.ema_decay) * new_vs.value
+                )
+            else:
+                blended_flat[k] = new_vs
+
         new_state = dataclasses.replace(
             new_state,
-            ema_params=jax.tree.map(
-                lambda old, new: state.ema_decay * old + (1.0 - state.ema_decay) * new,
-                state.ema_params,
-                new_full_params,
-            ),
+            ema_params=nnx.State.from_flat_path(blended_flat),
         )
 
     kernel_params = nnx.state(

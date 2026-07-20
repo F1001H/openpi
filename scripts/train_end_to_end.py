@@ -165,11 +165,11 @@ def init_train_state(
             # init with partial_params=None) and the eval_shape pass, which
             # never takes this branch. Root cause not fully confirmed against
             # NNX's replace_by_pure_dict source, but the fix below sidesteps
-            # the question entirely: per-leaf `.value = ...` mutation (the
-            # same pattern load_and_merge_predictor_state already uses) can
-            # only change array VALUES at paths that already exist in the
-            # graph -- it cannot add or remove graph nodes, so it cannot
-            # reproduce this failure mode regardless of the exact cause.
+            # the question entirely: per-leaf dict-item reassignment on the
+            # pure dict (the same pattern load_and_merge_predictor_state
+            # uses) can only change array VALUES at paths that already exist
+            # in the graph -- it cannot add or remove graph nodes, so it
+            # cannot reproduce this failure mode regardless of the exact cause.
             graphdef, state = nnx.split(model)
             pure = state.to_pure_dict()
             flat_partial = traverse_util.flatten_dict(partial_params, sep=".")
@@ -181,8 +181,11 @@ def init_train_state(
                     for p in parts[:-1]:
                         d = d[p] if p in d else d[int(p)]
                     leaf_key = parts[-1]
-                    target = d[leaf_key] if leaf_key in d else d[int(leaf_key)]
-                    target.value = jnp.asarray(value)
+                    # Same fix as convert_checkpoint.py's _set(): `d` holds
+                    # raw arrays (from to_pure_dict()), not nnx.Variable, so
+                    # this has to be a dict-item reassignment.
+                    key = leaf_key if leaf_key in d else int(leaf_key)
+                    d[key] = jnp.asarray(value)
                 except (KeyError, IndexError):
                     missing.append(flat_key)
             if missing:
@@ -219,7 +222,13 @@ def init_train_state(
             tx=tx,
             opt_state=tx.init(params.filter(config.trainable_filter)),
             ema_decay=config.ema_decay,
-            ema_params=None if config.ema_decay is None else params,
+            # Only the trainable subset -- for a LoRA config, frozen leaves
+            # (the multi-GB Gemma/SigLIP backbone) never change during
+            # training, so tracking/duplicating them in ema_params is pure
+            # waste. train_step's blend and jepa's _get_teacher_model()
+            # merge this sparse slice back over the live frozen params.
+            # checkpoints.py's _split_params() does the same at save time.
+            ema_params=None if config.ema_decay is None else params.filter(config.trainable_filter),
         )
 
     train_state_shape = jax.eval_shape(init, init_rng)

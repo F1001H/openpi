@@ -7,6 +7,7 @@ import logging
 from typing import Protocol
 
 from etils import epath
+from flax import nnx
 import jax
 import orbax.checkpoint as ocp
 import orbax.checkpoint.future as future
@@ -145,6 +146,19 @@ class CallbackRestore(ocp.args.CheckpointArgs): ...
 def _split_params(state: training_utils.TrainState) -> tuple[training_utils.TrainState, at.Params]:
     if state.ema_params is not None:
         params = state.ema_params
+        # ema_params may only cover a trainable subset rather than the full
+        # model (see jepa/train_step_transitions.py -- storing/blending
+        # frozen leaves in EMA is pure waste since they never change).
+        # Reconstruct the full tree here, at save time only, by filling in
+        # whatever's missing from the live/online params. For a full-
+        # structure ema_params (the common, non-JEPA case) the key sets
+        # already match, so this is a no-op.
+        ema_keys = set(params.flat_state())
+        full_keys = set(state.params.flat_state())
+        if ema_keys != full_keys:
+            full_flat = dict(state.params.flat_state())
+            full_flat.update(dict(params.flat_state()))
+            params = nnx.State.from_flat_path(full_flat)
         train_state = dataclasses.replace(state, ema_params=None)
     else:
         params = state.params

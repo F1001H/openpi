@@ -3,7 +3,7 @@ import jax
 import jax.numpy as jnp
 import flax.nnx as nnx
 
-from ac_predictor import VisionTransformerPredictorAC
+from ac_predictor_nnx import VisionTransformerPredictorAC
 from convert_checkpoint import convert, load_pytorch_predictor_state, flatten_nnx_state
 
 def verify_conversion(ckpt_path: str):

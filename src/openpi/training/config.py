@@ -208,8 +208,25 @@ class DataConfigFactory(abc.ABC):
                 # Check if it's raw LeRobot style (missing the top-level norm_stats key)
                 if "norm_stats" not in raw_data:
                     logging.info("Adapting LeRobot stats layout to OpenPI schema format...")
+                    # LeRobot's raw stats.json is keyed by ITS OWN raw column
+                    # names ("action", "observation.state", ...). But
+                    # Normalize/Unnormalize transforms run AFTER
+                    # repack_transforms + data_transforms in the real
+                    # pipeline, where the data dict has already been renamed
+                    # to the canonical model-facing keys ("actions", "state").
+                    # Without this rename, norm_stats' keys never match what
+                    # apply_tree looks up (it silently no-ops on unmatched
+                    # keys, strict=False) -- verified this has been happening
+                    # for every local-root config (every Kobo BC/JEPA
+                    # training run in this repo so far, since Kobo is
+                    # currently the only config using a local root rather
+                    # than a Hub repo_id): actions/state were never actually
+                    # being normalized despite Normalize appearing in the
+                    # pipeline.
+                    raw_to_canonical = {"action": "actions", "observation.state": "state"}
+                    raw_data = {raw_to_canonical.get(k, k): v for k, v in raw_data.items()}
                     raw_data = {"norm_stats": raw_data}
-                
+
                 # Use OpenPI's internal deserializer hook with the modified layout dict
                 return _normalize.deserialize_json(json.dumps(raw_data))
             else:
@@ -252,6 +269,26 @@ class SimpleDataConfig(DataConfigFactory):
             model_transforms=self.model_transforms(model_config),
         )
     
+
+def _pad_norm_stats(stats: _transforms.NormStats, target_dim: int) -> _transforms.NormStats:
+    """Zero/one-pad a NormStats entry up to target_dim, mirroring
+    Unnormalize's own pad_to_dim convention (mean/q01 -> 0, std/q99 -> 1) so
+    Normalize (which slices stats DOWN to the data's shape rather than
+    padding them up) receives stats already at the right dimensionality.
+    No-ops if stats are already >= target_dim."""
+    def pad(arr, value):
+        if arr is None or arr.shape[-1] >= target_dim:
+            return arr
+        return _transforms.pad_to_dim(arr, target_dim, value=value)
+
+    return dataclasses.replace(
+        stats,
+        mean=pad(stats.mean, 0.0),
+        std=pad(stats.std, 1.0),
+        q01=pad(stats.q01, 0.0),
+        q99=pad(stats.q99, 1.0),
+    )
+
 
 @dataclasses.dataclass(frozen=True)
 class KoboDataConfig(DataConfigFactory):
@@ -306,9 +343,37 @@ class KoboDataConfig(DataConfigFactory):
         # 4. Model Transforms: Automatically creates baseline tokenization frameworks for prompts
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
 
+        base_config = self.create_base_config(assets_dirs, model_config)
+
+        # Kobo's norm_stats come directly from the dataset's raw stats.json
+        # (DataConfigFactory._load_norm_stats' local-root branch), at the
+        # dataset's NATIVE (unpadded) action/state dimensionality (e.g. 8) --
+        # but Normalize (src/openpi/transforms.py) is applied to data AFTER
+        # PadStatesAndActions has zero-padded it to model_config.action_dim
+        # (e.g. 32), and Normalize's _normalize/_normalize_quantile both
+        # SLICE stats down to x's shape rather than padding stats UP --
+        # correct if stats came from the standard compute_norm_stats.py
+        # workflow (which runs post-padding), wrong here. Unnormalize already
+        # handles this direction correctly (pad_to_dim / explicit pass-
+        # through for the extra dims); rather than touch the shared
+        # Normalize transform (other configs rely on its current behavior
+        # with already-padded stats), pad Kobo's OWN norm_stats here so
+        # Normalize receives correctly-shaped stats to begin with. The padded
+        # region carries no real signal (always exactly 0 pre-padding, and
+        # discarded again by KoboOutputs' slice on the way out), so the
+        # padding VALUE only needs to be finite and deterministic, not
+        # semantically meaningful.
+        norm_stats = base_config.norm_stats
+        if norm_stats is not None:
+            padded_stats = dict(norm_stats)
+            for key in ("state", "actions"):
+                if key in padded_stats:
+                    padded_stats[key] = _pad_norm_stats(padded_stats[key], model_config.action_dim)
+            base_config = dataclasses.replace(base_config, norm_stats=padded_stats)
+
         # Assemble and pass complete DataConfig asset mapping back to the model constructor
         return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
+            base_config,
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,

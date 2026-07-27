@@ -44,7 +44,13 @@ JEPA_NPZ_CKPT="${JEPA_NPZ_CKPT:-$SHARED_WS/fabian/jepa_predictor/vjepa2_ac_conve
 export HF_HOME="${HF_HOME:-/mnt/vast/workspaces/VLA_Reinforcement/huggingface}"
 export OPENPI_DATA_HOME="${OPENPI_DATA_HOME:-/mnt/vast/workspaces/VLA_Reinforcement/openpi_cache}"
 
-CONFIG_NAME="pi0_kobo_cube"
+# Override with CONFIG_NAME=pi0_kobo_cube_low_mem for the LoRA variant (much
+# smaller memory footprint -- trainable_filter only covers LoRA deltas + JEPA
+# predictor + projection heads, not the full frozen backbone, so both the
+# static params/opt_state/EMA budget and per-step activation memory are far
+# smaller than the full pi0_kobo_cube fine-tune, which OOM'd at batch_size=32
+# even on an 80GB H100 during the actual training step, not just init).
+CONFIG_NAME="${CONFIG_NAME:-pi0_kobo_cube_low_mem}"
 # Deliberately NOT timestamped: --resume below only continues the same run if
 # checkpoints/$CONFIG_NAME/$EXP_NAME/ matches the earlier submission. Plain
 # `sbatch slurm/train_pi0_kobo_cube.slurm` reruns/resumes THIS run; pass
@@ -94,7 +100,6 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train_end_to_end.py \
     --exp-name="$EXP_NAME" \
     --resume \
     --data.root="$DATASET_ROOT" \
-    --jepa-predictor-checkpoint "$JEPA_NPZ_CKPT" \
-    --num-train-steps=100 \
+    --jepa-predictor-checkpoint "$JEPA_NPZ_CKPT"
 
 echo "Done. Checkpoints under checkpoints/$CONFIG_NAME/$EXP_NAME/"

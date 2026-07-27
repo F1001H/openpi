@@ -389,3 +389,272 @@ class JepaTransitionDataLoader:
 
     def close(self):
         self._stop.set()
+
+
+# --------------------------------------------------------------------------- #
+# 6. Q-chunking: (embed_t, proprio_t, action_chunk[h], chunk_reward,
+#    embed_{t+h}, proprio_{t+h}, chunk_mask) for chunked-TD critic training
+#    (see src/qc/). Both reward AND the vision embedding are read from a
+#    cache produced once by scripts/qc_label_rewards.py (per-frame pooled
+#    JEPA vision embedding + per-step JEPA prediction-error reward for the
+#    whole dataset) -- critic training never touches the image pipeline or
+#    the (multi-GB) JEPA/VLA model at all, only this small cache, raw
+#    low-dim state/action (cheap, no video decoding), and the critic itself.
+#    Reward is discount-accumulated over the chunk here (not in the cache),
+#    so horizon_length/discount can change without re-running the labeling
+#    pass.
+# --------------------------------------------------------------------------- #
+
+class QChunkTransitionDataset(IterableDataset):
+    """Streams (embed_t, proprio_t, action_chunk, chunk_reward, embed_th,
+    proprio_th, chunk_mask) samples, shuffled at the episode level.
+    h = horizon_length. Does NOT use LeRobotV3TransitionIterableDataset's
+    image/transform pipeline at all -- see module docstring above."""
+
+    def __init__(
+        self,
+        config: _config.TrainConfig,
+        repo_id_or_root: str,
+        horizon_length: int,
+        qc_cache_path: str,
+        discount: float = 0.99,
+        is_local_root: bool = False,
+        shuffle_episodes: bool = True,
+        seed: int = 0,
+    ):
+        self.config = config
+        self.repo_id_or_root = repo_id_or_root
+        self.horizon_length = horizon_length
+        self.discount = discount
+        self.is_local_root = is_local_root
+        self.shuffle_episodes = shuffle_episodes
+        self.seed = seed
+
+        meta = _load_meta(repo_id_or_root, is_local_root)
+        self.fps = meta.fps
+        self.episode_ranges = _episode_frame_ranges(meta)
+        self.num_episodes = len(self.episode_ranges)
+
+        cache = np.load(qc_cache_path)
+        self._rewards_by_episode = {
+            int(k.split("_")[1]): cache[k] for k in cache.files if k.startswith("episode_")
+        }
+        self._embeds_by_episode = {
+            int(k.split("_")[1]): cache[k] for k in cache.files if k.startswith("embed_")
+        }
+        # [n_frames, num_candidates, horizon_length, action_dim] per episode --
+        # candidate action chunks sampled from the FROZEN BC actor at labeling
+        # time (scripts/qc_label_rewards.py), used as the Q-chunking TD
+        # target's off-policy "next actions" (scored by the critic being
+        # trained, in src/qc/train_step.py) instead of the actual recorded
+        # next action chunk (Phase 1's SARSA-style simplification). Requires
+        # this cache to have been built with the SAME horizon_length as here.
+        self._candidates_by_episode = {
+            int(k.split("_")[1]): cache[k] for k in cache.files if k.startswith("candidates_")
+        }
+        if "_horizon_length" in cache.files and int(cache["_horizon_length"]) != horizon_length:
+            raise ValueError(
+                f"qc_cache_path was built with horizon_length={int(cache['_horizon_length'])}, "
+                f"but this dataset was constructed with horizon_length={horizon_length} -- "
+                "candidate action chunks won't match. Re-run qc_label_rewards.py with "
+                "--horizon-length matching this value."
+            )
+        missing = [i for i in range(self.num_episodes) if i not in self._rewards_by_episode]
+        if missing:
+            raise ValueError(
+                f"qc_cache_path ({qc_cache_path}) is missing {len(missing)} episodes present "
+                f"in the dataset (e.g. {missing[:5]}) -- was it computed against this same dataset root, "
+                "with scripts/qc_label_rewards.py?"
+            )
+
+    def _build_dataset(self) -> LeRobotDataset:
+        # Only "observation.state"/"action" are ever accessed by _get_chunk
+        # below -- no camera columns in delta_timestamps, and image columns
+        # are never indexed on the returned item, so (assuming LeRobot v3's
+        # typical lazy per-column video decode -- not independently verified
+        # here) no video decoding happens for this dataset at all.
+        step = 1.0 / self.fps
+        chunk_span = self.horizon_length * step
+        delta_timestamps = {
+            "observation.state": [0.0, chunk_span],
+            "action": [i * step for i in range(self.horizon_length)],
+        }
+        kwargs = {"root": self.repo_id_or_root, "repo_id": self.repo_id_or_root} if self.is_local_root else {"repo_id": self.repo_id_or_root}
+        return LeRobotDataset(delta_timestamps=delta_timestamps, **kwargs)
+
+    def __iter__(self) -> Iterator[dict]:
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+        num_workers = worker_info.num_workers if worker_info is not None else 1
+
+        if getattr(self, "_cached_dataset", None) is None:
+            self._cached_dataset = self._build_dataset()
+        dataset = self._cached_dataset
+
+        rng = np.random.default_rng(self.seed + worker_id)
+        episode_order = np.arange(self.num_episodes)
+        if self.shuffle_episodes:
+            rng.shuffle(episode_order)
+        episode_order = episode_order[worker_id::num_workers]
+
+        for ep_i in episode_order:
+            frm, to = self.episode_ranges[int(ep_i)]
+            ep_rewards = self._rewards_by_episode[int(ep_i)]
+            # qc_label_rewards.py caches embeddings/candidates for the same
+            # n=len(ep_rewards) frames as rewards (obs_t of each of the n
+            # valid transitions) -- one short of all (to-frm) frames in the
+            # episode (the very last frame's embedding is never cached). A
+            # chunk starting at local index i needs embed[i] and
+            # embed[i+horizon_length] (+ candidates[i+horizon_length] for the
+            # TD target) all valid, i.e. i in [0, n_valid).
+            n_valid = len(ep_rewards) - self.horizon_length
+            if n_valid <= 0:
+                continue
+            local_indices = np.arange(n_valid)
+            if self.shuffle_episodes:
+                rng.shuffle(local_indices)
+            ep_embeds = self._embeds_by_episode[int(ep_i)]
+            ep_candidates = self._candidates_by_episode[int(ep_i)]
+            for local_idx in local_indices:
+                global_idx = frm + int(local_idx)
+                yield self._get_chunk(dataset, global_idx, int(local_idx), ep_rewards, ep_embeds, ep_candidates)
+
+    def _get_chunk(
+        self,
+        dataset: LeRobotDataset,
+        real_idx: int,
+        local_idx: int,
+        ep_rewards: np.ndarray,
+        ep_embeds: np.ndarray,
+        ep_candidates: np.ndarray,
+    ) -> dict:
+        item = dataset[real_idx]
+
+        state = np.asarray(item["observation.state"])
+        proprio_t, proprio_th = state[0].astype(np.float32), state[1].astype(np.float32)
+        action_chunk = np.asarray(item["action"], dtype=np.float32)  # [horizon_length, action_dim]
+
+        # Off-policy TD target candidates: num_candidates action chunks
+        # sampled from the FROZEN BC actor at obs_{t+h} (cached once at
+        # labeling time, since the BC actor never changes during critic
+        # training -- see scripts/qc_label_rewards.py's module docstring).
+        # src/qc/train_step.py's critic_loss_fn scores these with the target
+        # critic and picks the best, matching the reference's best-of-N target
+        # (acfql.py's actor_type="best-of-n") without ever needing the VLA
+        # model loaded during critic training.
+        next_action_candidates = ep_candidates[local_idx + self.horizon_length]  # [num_candidates, h, a]
+
+        # Discounted cumulative reward over the chunk: r0 + gamma*r1 + ... +
+        # gamma^(h-1)*r_{h-1}, matching the reference repo's sample_sequence
+        # semantics (confirmed from ColinQiyangLi/qc's utils/datasets.py).
+        # mask is always 1.0 here: local_idx only ever ranges over [0, n_valid)
+        # (see __iter__), which by construction never crosses an episode
+        # boundary -- kobo's offline demo episodes have no early-termination
+        # events mid-episode. Kept as an explicit field for compatibility with
+        # the critic's expected batch keys (acfql.py's critic_loss consumes
+        # batch['masks'][..., -1]) and in case kobo data later gets per-frame
+        # success/failure labels that would make it meaningfully non-trivial.
+        step_rewards = ep_rewards[local_idx : local_idx + self.horizon_length]
+        discounts = self.discount ** np.arange(self.horizon_length)
+        chunk_reward = np.float32(np.sum(step_rewards * discounts))
+        chunk_mask = np.float32(1.0)
+
+        return {
+            "embed_t": ep_embeds[local_idx],
+            "proprio_t": proprio_t,
+            "action_chunk": action_chunk,
+            "reward": chunk_reward,
+            "embed_th": ep_embeds[local_idx + self.horizon_length],
+            "proprio_th": proprio_th,
+            "next_action_candidates": next_action_candidates,
+            "mask": chunk_mask,
+        }
+
+
+def _collate_qchunk(batch: list[dict]) -> dict:
+    return {k: np.stack([b[k] for b in batch]) for k in batch[0]}
+
+
+def raw_batch_to_qchunk(
+    raw: dict,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    return (
+        jnp.asarray(raw["embed_t"]),
+        jnp.asarray(raw["proprio_t"]),
+        jnp.asarray(raw["action_chunk"]),
+        jnp.asarray(raw["reward"]),
+        jnp.asarray(raw["embed_th"]),
+        jnp.asarray(raw["proprio_th"]),
+        jnp.asarray(raw["next_action_candidates"]),
+        jnp.asarray(raw["mask"]),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 7. JAX-facing infinite iterator for Q-chunking -- mirrors JepaTransitionDataLoader.
+# --------------------------------------------------------------------------- #
+
+class QChunkDataLoader:
+    """No data_config()/openpi.training.checkpoints integration -- unlike
+    JepaTransitionDataLoader, this doesn't run the Observation-based transform
+    pipeline at all (see QChunkTransitionDataset above), so there's no
+    DataConfig/norm_stats/asset_id to expose. The critic's own checkpointing
+    (scripts/train_qc_critic.py) doesn't reuse openpi.training.checkpoints'
+    save_state, which requires that Protocol -- it's a simpler, separate
+    subsystem."""
+
+    def __init__(
+        self,
+        config: _config.TrainConfig,
+        repo_id_or_root: str,
+        horizon_length: int,
+        qc_cache_path: str,
+        data_sharding: jax.sharding.NamedSharding,
+        batch_size: int,
+        discount: float = 0.99,
+        num_workers: int = 4,
+        is_local_root: bool = False,
+        prefetch: int = 4,
+        seed: int = 0,
+    ):
+        self.data_sharding = data_sharding
+        dataset = QChunkTransitionDataset(
+            config, repo_id_or_root, horizon_length, qc_cache_path, discount=discount,
+            is_local_root=is_local_root, shuffle_episodes=True, seed=seed,
+        )
+        self._torch_loader = TorchDataLoader(
+            dataset,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            collate_fn=_collate_qchunk,
+            drop_last=True,
+            persistent_workers=num_workers > 0,
+        )
+        self._queue: "queue.Queue" = queue.Queue(maxsize=prefetch)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def _worker(self):
+        try:
+            while not self._stop.is_set():
+                for raw in self._torch_loader:
+                    if self._stop.is_set():
+                        return
+                    batch = raw_batch_to_qchunk(raw)
+                    batch = tuple(jax.device_put(x, self.data_sharding) for x in batch)
+                    self._queue.put(batch)
+        except Exception as e:  # noqa: BLE001
+            self._queue.put(e)
+
+    def __iter__(
+        self,
+    ) -> Iterator[tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
+        while True:
+            item = self._queue.get()
+            if isinstance(item, Exception):
+                raise RuntimeError("QChunkDataLoader background thread failed") from item
+            yield item
+
+    def close(self):
+        self._stop.set()

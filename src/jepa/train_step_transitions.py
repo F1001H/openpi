@@ -345,7 +345,9 @@ def compute_intrinsic_reward(
     config: _config.TrainConfig,
     state: training_utils.TrainState,
     obs_t: _model.Observation,
-    action_t: jnp.ndarray,   # [B, action_dim] -- single-step action, NOT a chunk
+    action_t: jnp.ndarray,   # [B, model.config.action_dim] -- single-step action (Pi0's padded
+                             # dim, e.g. 32), NOT a chunk -- same convention as action_chunk[:, 0, :]
+                             # in train_step's loss_fn.
     obs_t1: _model.Observation,
 ) -> jnp.ndarray:
     """Per-transition curiosity reward from JEPA prediction error.
@@ -360,11 +362,20 @@ def compute_intrinsic_reward(
     a `state` you've deliberately frozen rather than the live training state.
     """
     model = nnx.merge(state.model_def, jax.lax.stop_gradient(state.params))
+    # action_t/proprio arrive in Pi0's padded action_dim (e.g. 32); the
+    # predictor's action/state encoders are pretrained on the V-JEPA2-AC
+    # checkpoint's native 7-dim space (see convert_checkpoint.py) -- train_step's
+    # loss_fn applies these same projections before calling jepa_predictor, and
+    # skipping them here (as the original version of this function did) is a
+    # shape mismatch against action_encoder's (7, 1024) kernel, since this was
+    # never actually exercised by any caller before now.
+    action_t = model.action_proj(action_t)
+    proprio_t = model.state_proj(_get_proprio(obs_t))
     z_context = model.extract_vision_latents(obs_t)
     z_pred = model.jepa_predictor(
         z_context,
         actions=action_t[:, None, :],
-        states=_get_proprio(obs_t)[:, None, :],
+        states=proprio_t[:, None, :],
     )
 
     target_model = _get_teacher_model(state)

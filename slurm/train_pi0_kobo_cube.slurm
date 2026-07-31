@@ -5,8 +5,8 @@
 # valid SLURM account/project name -- omitting it lets SLURM use the default
 # association for the user. If sbatch complains about a missing/required
 # account, run `sacctmgr show associations user=$USER` to find the real name.
-#SBATCH --gres=gpu:h100:1                # cn01's Gres=gpu:h100:8 confirms the GRES name is "h100"
-#SBATCH --cpus-per-task=14               # 112 CPUs / 8 GPUs per node (cn01) -- proportional 1-GPU share
+#SBATCH --gres=gpu:h100:2                # cn01's Gres=gpu:h100:8 confirms the GRES name is "h100"
+#SBATCH --cpus-per-task=28               # 112 CPUs / 8 GPUs per node (cn01) -- proportional 1-GPU share
 #SBATCH --mem=128G
 #SBATCH --output=slurm/logs/%x-%j.out
 #SBATCH --error=slurm/logs/%x-%j.out
@@ -50,7 +50,7 @@ export OPENPI_DATA_HOME="${OPENPI_DATA_HOME:-/mnt/vast/workspaces/VLA_Reinforcem
 # static params/opt_state/EMA budget and per-step activation memory are far
 # smaller than the full pi0_kobo_cube fine-tune, which OOM'd at batch_size=32
 # even on an 80GB H100 during the actual training step, not just init).
-CONFIG_NAME="${CONFIG_NAME:-pi0_kobo_cube_low_mem}"
+CONFIG_NAME="${CONFIG_NAME:-pi0_kobo_cube}"
 # Deliberately NOT timestamped: --resume below only continues the same run if
 # checkpoints/$CONFIG_NAME/$EXP_NAME/ matches the earlier submission. Plain
 # `sbatch slurm/train_pi0_kobo_cube.slurm` reruns/resumes THIS run; pass

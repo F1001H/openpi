@@ -144,6 +144,12 @@ class OpenPIWithJEPA(nnx.Module):
         self.action_proj = nnx.Linear(config.model.action_dim, action_dim, use_bias=True, rngs=rngs)
         self.state_proj = nnx.Linear(config.model.action_dim, action_dim, use_bias=True, rngs=rngs)
 
+        # See TrainConfig.jepa_stopgrad_vision's docstring (config.py) -- an
+        # nnx.Module attribute rather than a getattr(config, ...) call at use
+        # site (unlike the other JEPA hyperparams) because extract_vision_latents
+        # needs it and doesn't otherwise have config in scope.
+        self.jepa_stopgrad_vision = getattr(config, "jepa_stopgrad_vision", False)
+
     def __call__(self, *args, **kwargs):
         return self.base_model(*args, **kwargs)
 
@@ -159,8 +165,24 @@ class OpenPIWithJEPA(nnx.Module):
         the token count in a way the predictor's forward() would silently
         misinterpret as multiple time frames (T = N_ctxt // (grid_h*grid_w)),
         not multiple camera views.
+
+        If jepa_stopgrad_vision is set, image_tokens (PaliGemma.img's raw
+        output, before vision_proj) is stop-gradiented here -- this is the
+        ONE place both the online JEPA-context call (train_step's z_context)
+        and the teacher call (h_raw, already fully detached anyway via
+        _get_teacher_model's stop-gradiented params) go through, so gating it
+        here cuts JEPA's gradient contribution to the SHARED PaliGemma/SigLIP
+        weights (which BC's own embed_prefix call also depends on for action
+        prediction) without touching jepa_predictor/vision_proj/action_proj/
+        state_proj's own training -- those still get real gradients, just
+        computed on top of a frozen (for JEPA's purposes) vision feature.
+        Inference-only callers (compute_intrinsic_reward, qc_label_rewards.py,
+        inference_online.py) never differentiate through this at all, so the
+        stop_gradient is a no-op for them either way.
         """
         image_tokens, _ = self.base_model.PaliGemma.img(obs.images["base_0_rgb"], train=False)
+        if self.jepa_stopgrad_vision:
+            image_tokens = jax.lax.stop_gradient(image_tokens)
         return self.vision_proj(image_tokens)
 
 

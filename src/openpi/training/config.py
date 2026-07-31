@@ -691,6 +691,31 @@ class TrainConfig:
     # data parallel between 2 groups of devices.
     fsdp_devices: int = 1
 
+    # JEPA co-training hyperparameters (src/jepa/train_step_transitions.py's
+    # train_step/compute_intrinsic_reward). Only meaningful for the JEPA
+    # entrypoint (scripts/train_end_to_end.py); ignored by the plain BC
+    # entrypoint (scripts/train.py). Previously these were read via
+    # getattr(config, "...", default) with NO corresponding TrainConfig
+    # fields anywhere -- meaning every run silently used the hardcoded
+    # defaults below with no way to override them from the CLI. Adding them
+    # as real fields (same default values, so existing behavior is
+    # unchanged) to make them actually configurable -- needed for the
+    # jepa_stopgrad_vision ablation below.
+    alpha_bc: float = 1.0
+    beta_jepa: float = 0.5
+    jepa_loss_exp: float = 2.0
+    # If true, stop-gradients the shared SigLIP vision features (PaliGemma.
+    # img's output) at the point they enter the JEPA path (before
+    # vision_proj), so the JEPA loss can still train jepa_predictor/
+    # vision_proj/action_proj/state_proj but can no longer backprop into the
+    # SAME vision backbone weights BC's own embed_prefix depends on. Added
+    # 2026-07-31 to test whether JEPA co-training sharing gradients into the
+    # vision backbone is what's degrading BC's spatial precision (see memory:
+    # project_qchunking_posttraining.md's "MAJOR finding" + follow-up
+    # sections) -- default False preserves the original joint-gradient
+    # behavior used by e.g. full_lora_test.
+    jepa_stopgrad_vision: bool = False
+
     @property
     def assets_dirs(self) -> pathlib.Path:
         """Get the assets directory for this config."""

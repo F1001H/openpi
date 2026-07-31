@@ -5,8 +5,8 @@
 # valid SLURM account/project name -- omitting it lets SLURM use the default
 # association for the user. If sbatch complains about a missing/required
 # account, run `sacctmgr show associations user=$USER` to find the real name.
-#SBATCH --gres=gpu:h100:1                # cn01's Gres=gpu:h100:8 confirms the GRES name is "h100"
-#SBATCH --cpus-per-task=14               # 112 CPUs / 8 GPUs per node (cn01) -- proportional 1-GPU share
+#SBATCH --gres=gpu:h100:2                # cn01's Gres=gpu:h100:8 confirms the GRES name is "h100"
+#SBATCH --cpus-per-task=28               # 112 CPUs / 8 GPUs per node (cn01) -- proportional 1-GPU share
 #SBATCH --mem=128G
 #SBATCH --output=slurm/logs/%x-%j.out
 #SBATCH --error=slurm/logs/%x-%j.out

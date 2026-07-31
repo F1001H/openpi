@@ -72,12 +72,19 @@ fi
 
 export WANDB_MODE="${WANDB_MODE:-offline}"
 
+# FSDP_DEVICES matches the #SBATCH --gres=gpu:h100:2 request above -- without
+# --fsdp-devices, config.fsdp_devices defaults to 1 and the mesh only uses a
+# single device, leaving the second allocated GPU idle instead of actually
+# sharding the model to get the memory headroom the 2-GPU request is for.
+FSDP_DEVICES="${FSDP_DEVICES:-2}"
+
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train_end_to_end.py \
     "$CONFIG_NAME" \
     --exp-name="$EXP_NAME" \
     --resume \
     --data.root="$DATASET_ROOT" \
     --checkpoint-base-dir="$CHECKPOINT_BASE_DIR" \
+    --fsdp-devices="$FSDP_DEVICES" \
     --jepa-predictor-checkpoint "$JEPA_NPZ_CKPT"
 
 echo "Done. Checkpoints under $CHECKPOINT_BASE_DIR/$CONFIG_NAME/$EXP_NAME/"

@@ -76,7 +76,7 @@ export WANDB_MODE="${WANDB_MODE:-offline}"
 # --fsdp-devices, config.fsdp_devices defaults to 1 and the mesh only uses a
 # single device, leaving the second allocated GPU idle instead of actually
 # sharding the model to get the memory headroom the 2-GPU request is for.
-FSDP_DEVICES="${FSDP_DEVICES:-2}"
+FSDP_DEVICES="${FSDP_DEVICES:-4}"
 
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train_end_to_end.py \
     "$CONFIG_NAME" \

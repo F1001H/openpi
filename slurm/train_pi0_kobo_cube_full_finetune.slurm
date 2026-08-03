@@ -7,7 +7,15 @@
 # account, run `sacctmgr show associations user=$USER` to find the real name.
 #SBATCH --gres=gpu:h100:4                # cn01's Gres=gpu:h100:8 confirms the GRES name is "h100"
 #SBATCH --cpus-per-task=56               # 112 CPUs / 8 GPUs per node (cn01) -- proportional 1-GPU share
-#SBATCH --mem=128G
+# 128G was NOT enough -- got a SLURM oom_kill (host RAM, not GPU VRAM) right
+# at step 1000's checkpoint save. Full (non-LoRA) fine-tune's optimizer state
+# alone needs ~41GB staged in host memory during the save (see the
+# "Transferring arrays to host memory" / train_state write in the crash log),
+# on top of the running process's own footprint and per-GPU staging buffers
+# (4 GPUs each contributing their own). cn01-class nodes have ~2TB RAM total
+# across 8 GPUs, so 512G leaves generous headroom without meaningfully
+# competing for the node's capacity.
+#SBATCH --mem=512G
 #SBATCH --output=slurm/logs/%x-%j.out
 #SBATCH --error=slurm/logs/%x-%j.out
 
@@ -72,7 +80,7 @@ fi
 
 export WANDB_MODE="${WANDB_MODE:-offline}"
 
-# FSDP_DEVICES matches the #SBATCH --gres=gpu:h100:2 request above -- without
+# FSDP_DEVICES matches the #SBATCH --gres=gpu:h100:4 request above -- without
 # --fsdp-devices, config.fsdp_devices defaults to 1 and the mesh only uses a
 # single device, leaving the second allocated GPU idle instead of actually
 # sharding the model to get the memory headroom the 2-GPU request is for.

@@ -29,6 +29,29 @@ REPO_ID="${REPO_ID:-physical-intelligence/libero}"
 export HF_HOME="${HF_HOME:-/mnt/vast/workspaces/VLA_Reinforcement/huggingface}"
 export OPENPI_DATA_HOME="${OPENPI_DATA_HOME:-/mnt/vast/workspaces/VLA_Reinforcement/openpi_cache}"
 
+# Anonymous/unauthenticated requests (esp. to HF's "Xet" storage backend's
+# .../xet-read-token endpoint) hit a 429 from this cluster's IP range while
+# downloading physical-intelligence/libero (a heavily-shared dataset).
+# huggingface_hub's get_token() checks the HF_TOKEN env var BEFORE the
+# $HF_HOME/token file -- deliberately relying on that here instead of
+# `huggingface-cli login`, since HF_HOME above is the SHARED team workspace
+# and `login` would write the token file there, exposing your personal
+# token to everyone else with access to it. Instead, add this to your own
+# ~/.bashrc (private, in your home dir, never touches shared storage):
+#   export HF_TOKEN=hf_...
+# (token from https://huggingface.co/settings/tokens -- "Read" scope is
+# enough). sbatch inherits your shell's environment by default, so it flows
+# into every job automatically with no per-job passing needed. This only
+# warns, doesn't fail -- a token isn't strictly required, just makes the 429
+# far less likely.
+if [ -z "${HF_TOKEN:-}" ]; then
+    echo "WARNING: no HF_TOKEN env var set -- downloads will be unauthenticated and more" >&2
+    echo "         likely to hit a 429 rate limit. Add 'export HF_TOKEN=hf_...' to your own" >&2
+    echo "         ~/.bashrc (get a token at https://huggingface.co/settings/tokens) to fix" >&2
+    echo "         this for good -- do NOT run 'huggingface-cli login' with HF_HOME set to" >&2
+    echo "         the shared workspace, that would write your token where others can read it." >&2
+fi
+
 cd "$REPO_DIR"
 mkdir -p slurm/logs
 

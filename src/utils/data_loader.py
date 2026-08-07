@@ -54,6 +54,33 @@ import openpi.training.config as _config
 from openpi import transforms as _transforms
 
 
+def resolve_dataset_root(data_config: _config.DataConfig) -> tuple[str, bool]:
+    """Resolves a created DataConfig to (repo_id_or_root, is_local_root) the
+    way LeRobotDataset/LeRobotDatasetMetadata expect -- handling both
+    local-root configs (e.g. KoboDataConfig, root set via --data.root=... on
+    the CLI) and Hub repo_id configs (e.g. LeRobotLiberoDataConfig,
+    repo_id="physical-intelligence/libero"). Prefers root over repo_id when
+    both are set (matches KoboDataConfig-style local configs, which also set
+    a "local/..." placeholder repo_id).
+
+    NOTE: DataConfigFactory.create_base_config() always sets
+    root=self.root, unconditionally overwriting whatever root was set on
+    base_config -- for a KoboDataConfig-style config, the only way to
+    actually get a local root through right now is --data.root=/path on the
+    CLI (a base_config=DataConfig(root=...) value is silently discarded)."""
+    if data_config.root is not None:
+        return str(data_config.root), True
+    if data_config.repo_id is not None:
+        if data_config.repo_id.startswith("local/"):
+            raise ValueError(
+                f"config.data.repo_id ('{data_config.repo_id}') looks like a local-only placeholder, "
+                f"not a real Hub repo id, and config.data.root is None. Pass --data.root=/path/to/dataset "
+                f"on the CLI."
+            )
+        return data_config.repo_id, False
+    raise ValueError("config.data resolved to neither a root path nor a repo_id.")
+
+
 # --------------------------------------------------------------------------- #
 # 1. Lightweight metadata access (no full-dataset / no per-frame index)
 # --------------------------------------------------------------------------- #
@@ -105,6 +132,22 @@ def _episode_frame_ranges(meta) -> list[tuple[int, int]]:
 # 2. Real openpi transform pipeline, staged so we can inject "prompt" and
 #    swap in a reduced (no-tokenization) model_transforms list for obs_t1.
 # --------------------------------------------------------------------------- #
+
+def _infer_raw_state_action_keys(data_config: _config.DataConfig) -> tuple[str, str]:
+    """Reads the RAW (pre-repack) dataset column names for state/action off
+    data_config.repack_transforms' RepackTransform.structure -- the single
+    source of truth every DataConfigFactory (KoboDataConfig,
+    LeRobotLiberoDataConfig, ...) already defines this mapping in (structure
+    maps canonical keys like "observation/state"/"actions" to the dataset's
+    actual raw column names). Do NOT hardcode "observation.state"/"action"
+    here as if they were universal -- that's kobo's raw column naming only;
+    e.g. Libero's raw columns are "state"/"actions" instead (confirmed via a
+    real local smoke test against physical-intelligence/libero -- see
+    scripts/qc_label_rewards.py's module docstring for the dataset-agnostic
+    pipeline this feeds)."""
+    repack = next(t for t in data_config.repack_transforms.inputs if isinstance(t, _transforms.RepackTransform))
+    return repack.structure["observation/state"], repack.structure["actions"]
+
 
 def _build_transform_stages(config: _config.TrainConfig):
     data_config = config.data.create(config.assets_dirs, config.model)
@@ -165,6 +208,7 @@ class LeRobotV3TransitionIterableDataset(IterableDataset):
         self.data_config, self._pre_prompt, self._post_prompt_full, self._post_prompt_reduced = (
             _build_transform_stages(config)
         )
+        self._state_key, self._action_key = _infer_raw_state_action_keys(self.data_config)
 
     def __len__(self):
         return self.approx_valid_samples
@@ -172,8 +216,8 @@ class LeRobotV3TransitionIterableDataset(IterableDataset):
     def _build_dataset(self) -> LeRobotDataset:
         step = 1.0 / self.fps
         delta_timestamps = {
-            "observation.state": [0.0, step],
-            "action": [i * step for i in range(self.action_horizon)],
+            self._state_key: [0.0, step],
+            self._action_key: [i * step for i in range(self.action_horizon)],
         }
         for cam in self.camera_keys:
             delta_timestamps[cam] = [0.0, step]
@@ -229,15 +273,22 @@ class LeRobotV3TransitionIterableDataset(IterableDataset):
                     frame = (255 * frame).astype(np.uint8)
                 dest[cam] = frame
 
-        state = np.asarray(item["observation.state"])
+        state = np.asarray(item[self._state_key])
         state_t, state_t1 = state[0].astype(np.float32), state[1].astype(np.float32)
-        action = np.asarray(item["action"], dtype=np.float32)
+        action = np.asarray(item[self._action_key], dtype=np.float32)
         task = item.get("task", "")
         if not isinstance(task, str):
             task = str(task)
 
         # --- obs_t: full pipeline, real action chunk, real prompt ---------- #
-        raw_t = {**imgs_t, "observation.state": state_t, "action": action}
+        # "prompt" must be present BEFORE repack_transforms runs, not injected
+        # after: KoboDataConfig's repack structure doesn't reference "prompt"
+        # at all (extra dict keys are harmless -- RepackTransform only reads
+        # keys listed in its structure), but LeRobotLiberoDataConfig's repack
+        # structure DOES map "prompt": "prompt", i.e. it looks the key up
+        # immediately -- found via a real local-Libero smoke test, which
+        # KeyError'd here before this was moved earlier.
+        raw_t = {**imgs_t, self._state_key: state_t, self._action_key: action, "prompt": task}
         data_t = self._pre_prompt(dict(raw_t))
         if "prompt" not in data_t:
             data_t["prompt"] = task
@@ -245,10 +296,11 @@ class LeRobotV3TransitionIterableDataset(IterableDataset):
         self._ensure_image_mask(data_t)
 
         # --- obs_t1: reduced pipeline, dummy action (discarded), no tokenization --- #
-        # RepackTransform's structure unconditionally looks up "action" via
-        # its configured key, so a placeholder is required even though we
-        # never use obs_t1's "actions" output downstream.
-        raw_t1 = {**imgs_t1, "observation.state": state_t1, "action": np.zeros_like(action)}
+        # RepackTransform's structure unconditionally looks up the action key
+        # (and, for Libero-style configs, "prompt" too), so placeholders are
+        # required even though we never use obs_t1's "actions"/prompt output
+        # downstream.
+        raw_t1 = {**imgs_t1, self._state_key: state_t1, self._action_key: np.zeros_like(action), "prompt": task}
         data_t1 = self._pre_prompt(dict(raw_t1))
         data_t1 = self._post_prompt_reduced(data_t1)
         self._ensure_image_mask(data_t1)
@@ -405,6 +457,61 @@ class JepaTransitionDataLoader:
 #    pass.
 # --------------------------------------------------------------------------- #
 
+# Non-state/action columns QChunkTransitionDataset always reads off a
+# dataset item -- see _get_slim_hf_dataset's docstring for why this list
+# matters. The state/action column names themselves are dataset-specific
+# (see _infer_raw_state_action_keys) and passed in separately.
+_QCHUNK_FIXED_COLUMNS = ("episode_index", "index", "timestamp")
+
+
+def _get_slim_hf_dataset(dataset: LeRobotDataset, state_key: str, action_key: str):
+    """Returns a column-selected view of dataset.hf_dataset containing only
+    _QCHUNK_FIXED_COLUMNS plus state_key/action_key. Indexing the FULL
+    hf_dataset (dataset.hf_dataset[idx], which is what LeRobotDataset.__getitem__
+    and this file's earlier "_get_item_no_video" both did) decodes every
+    column present on that row -- including "observation.images.cam1"/"cam2",
+    which are HuggingFace Image(decode=True) feature columns embedded
+    directly in the arrow table, NOT lazily-decoded video files. That decode
+    happens unconditionally at row-index time, before you ever get to pick
+    which keys to keep -- so it happened regardless of delta_timestamps only
+    listing state/action, and regardless of never reading the image keys off
+    the result. Measured: ~237ms/item through the full dataset vs ~0ms/item
+    through this select_columns()'d view (dataset[i] and a first attempt at
+    skipping just _query_videos were both ~237ms -- the video branch was
+    never the bottleneck; this was). Call once per LeRobotDataset instance
+    (e.g. alongside _build_dataset), not per __getitem__ -- select_columns
+    builds a new view each call."""
+    dataset._ensure_hf_dataset_loaded()
+    cols = [c for c in (*_QCHUNK_FIXED_COLUMNS, state_key, action_key) if c in dataset.hf_dataset.column_names]
+    return dataset.hf_dataset.select_columns(cols)
+
+
+def _get_item_no_video(dataset: LeRobotDataset, slim_hf_dataset, idx: int) -> dict:
+    """Replicates LeRobotDataset.__getitem__'s non-video logic, but indexes
+    slim_hf_dataset (see _get_slim_hf_dataset) instead of dataset.hf_dataset
+    directly, and replicates _query_hf_dataset's column-stacking against that
+    same slim view instead of calling the bound method (which reads
+    self.hf_dataset -- the full, image-carrying table -- internally). Safe
+    here because QChunkTransitionDataset only ever reads the raw state/action
+    columns off the returned item."""
+    item = slim_hf_dataset[idx]
+    ep_idx = int(item["episode_index"])
+    abs_idx = int(item["index"])
+    if dataset.delta_indices is not None:
+        query_indices, padding = dataset._get_query_indices(abs_idx, ep_idx)
+        item = {**item, **padding}
+        for key, q_idx in query_indices.items():
+            if key not in slim_hf_dataset.column_names:
+                continue  # video keys and anything else _get_slim_hf_dataset excludes
+            relative_indices = (
+                q_idx if dataset._absolute_to_relative_idx is None
+                else [dataset._absolute_to_relative_idx[i] for i in q_idx]
+            )
+            column = slim_hf_dataset[key]
+            item[key] = [column[j] for j in relative_indices]
+    return item
+
+
 class QChunkTransitionDataset(IterableDataset):
     """Streams (embed_t, proprio_t, action_chunk, chunk_reward, embed_th,
     proprio_th, chunk_mask) samples, shuffled at the episode level.
@@ -434,6 +541,12 @@ class QChunkTransitionDataset(IterableDataset):
         self.fps = meta.fps
         self.episode_ranges = _episode_frame_ranges(meta)
         self.num_episodes = len(self.episode_ranges)
+
+        # See LeRobotV3TransitionIterableDataset's identical use of this --
+        # only built to read off the raw state/action column names, then
+        # discarded (this class does NOT use the transform pipeline itself).
+        data_config = config.data.create(config.assets_dirs, config.model)
+        self._state_key, self._action_key = _infer_raw_state_action_keys(data_config)
 
         cache = np.load(qc_cache_path)
         self._rewards_by_episode = {
@@ -468,16 +581,17 @@ class QChunkTransitionDataset(IterableDataset):
             )
 
     def _build_dataset(self) -> LeRobotDataset:
-        # Only "observation.state"/"action" are ever accessed by _get_chunk
+        # Only the raw state/action columns are ever accessed by _get_chunk
         # below -- no camera columns in delta_timestamps, and image columns
-        # are never indexed on the returned item, so (assuming LeRobot v3's
-        # typical lazy per-column video decode -- not independently verified
-        # here) no video decoding happens for this dataset at all.
+        # are never indexed on the returned item. See _get_slim_hf_dataset's
+        # docstring for why this dataset's per-item access still needs to go
+        # through a column-selected view rather than plain dataset[idx]/
+        # dataset.hf_dataset[idx] to actually avoid image decode overhead.
         step = 1.0 / self.fps
         chunk_span = self.horizon_length * step
         delta_timestamps = {
-            "observation.state": [0.0, chunk_span],
-            "action": [i * step for i in range(self.horizon_length)],
+            self._state_key: [0.0, chunk_span],
+            self._action_key: [i * step for i in range(self.horizon_length)],
         }
         kwargs = {"root": self.repo_id_or_root, "repo_id": self.repo_id_or_root} if self.is_local_root else {"repo_id": self.repo_id_or_root}
         return LeRobotDataset(delta_timestamps=delta_timestamps, **kwargs)
@@ -489,7 +603,9 @@ class QChunkTransitionDataset(IterableDataset):
 
         if getattr(self, "_cached_dataset", None) is None:
             self._cached_dataset = self._build_dataset()
+            self._cached_slim_hf = _get_slim_hf_dataset(self._cached_dataset, self._state_key, self._action_key)
         dataset = self._cached_dataset
+        slim_hf_dataset = self._cached_slim_hf
 
         rng = np.random.default_rng(self.seed + worker_id)
         episode_order = np.arange(self.num_episodes)
@@ -517,22 +633,25 @@ class QChunkTransitionDataset(IterableDataset):
             ep_candidates = self._candidates_by_episode[int(ep_i)]
             for local_idx in local_indices:
                 global_idx = frm + int(local_idx)
-                yield self._get_chunk(dataset, global_idx, int(local_idx), ep_rewards, ep_embeds, ep_candidates)
+                yield self._get_chunk(
+                    dataset, slim_hf_dataset, global_idx, int(local_idx), ep_rewards, ep_embeds, ep_candidates
+                )
 
     def _get_chunk(
         self,
         dataset: LeRobotDataset,
+        slim_hf_dataset,
         real_idx: int,
         local_idx: int,
         ep_rewards: np.ndarray,
         ep_embeds: np.ndarray,
         ep_candidates: np.ndarray,
     ) -> dict:
-        item = dataset[real_idx]
+        item = _get_item_no_video(dataset, slim_hf_dataset, real_idx)
 
-        state = np.asarray(item["observation.state"])
+        state = np.asarray(item[self._state_key])
         proprio_t, proprio_th = state[0].astype(np.float32), state[1].astype(np.float32)
-        action_chunk = np.asarray(item["action"], dtype=np.float32)  # [horizon_length, action_dim]
+        action_chunk = np.asarray(item[self._action_key], dtype=np.float32)  # [horizon_length, action_dim]
 
         # Off-policy TD target candidates: num_candidates action chunks
         # sampled from the FROZEN BC actor at obs_{t+h} (cached once at

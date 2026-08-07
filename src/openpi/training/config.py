@@ -1222,6 +1222,50 @@ _CONFIGS = [
         num_train_steps=30_000,
         batch_size=32,
     ),
+    # Mirrors pi0_kobo_cube_low_mem exactly (same model/LoRA/ema/lr_schedule
+    # setup that scripts/train_end_to_end.py's JEPA+QC pipeline
+    # -- scripts/qc_label_rewards.py -> scripts/train_qc_critic.py -- expects)
+    # but pointed at the standard physical-intelligence/libero Hub dataset
+    # instead of kobo's local bimanual_cube dataset. Added to validate the
+    # QC/JEPA pipeline against a unimanual, readily-available dataset while
+    # the real (kobo) robot is down. Libero's NATIVE (unpadded) dims -- see
+    # libero_policy.make_libero_example/LiberoOutputs -- are state=8,
+    # action=7 (vs. kobo's 8/8): pass --action-dim=7 to qc_label_rewards.py
+    # and train_qc_critic.py when using this config (proprio stays 8, so
+    # --proprio-dim's default is fine unchanged).
+    TrainConfig(
+        name="pi05_libero_low_mem",
+        model=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            pi05=True,
+            discrete_state_input=False,
+            action_horizon=10,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            pi05=True,
+            discrete_state_input=False,
+            action_horizon=10,
+        ).get_freeze_filter(),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        # See pi0_kobo_cube_low_mem's note above on why this stays non-None.
+        ema_decay=0.999,
+        num_train_steps=30_000,
+        batch_size=32,
+    ),
     TrainConfig(
         name="pi0_fast_kobo_cube",
         # Configured alternative targeting high-frequency, low-latency deployment runtimes

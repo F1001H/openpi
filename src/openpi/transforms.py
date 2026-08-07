@@ -177,7 +177,18 @@ class Unnormalize(DataTransformFn):
         assert stats.q99 is not None
         q01, q99 = stats.q01, stats.q99
         if (dim := q01.shape[-1]) < x.shape[-1]:
-            return np.concatenate([(x[..., :dim] + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01, x[..., dim:]], axis=-1)
+            # jnp, not np: x may be a traced array here (e.g. under jax.jit,
+            # as in scripts/qc_label_rewards.py's jitted _label_batch) --
+            # np.concatenate forces a concrete numpy conversion and raises
+            # TracerArrayConversionError in that case. Found via a real
+            # Libero smoke test: Libero's norm_stats stay at their native
+            # (unpadded) action dim, unlike kobo's, which KoboDataConfig
+            # explicitly pads to model_config.action_dim -- so kobo never
+            # exercises this branch under jit, but Libero (and any other
+            # dataset whose norm_stats aren't pre-padded) does.
+            return jax.numpy.concatenate(
+                [(x[..., :dim] + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01, x[..., dim:]], axis=-1
+            )
         return (x + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01
 
 

@@ -68,7 +68,7 @@ import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 
 from jepa.train_step_transitions import OpenPIWithJEPA, train_step
-from utils.data_loader import JepaTransitionDataLoader
+from utils.data_loader import JepaTransitionDataLoader, resolve_dataset_root
 
 
 # =========================================================================== #
@@ -287,24 +287,7 @@ def main(config: _config.TrainConfig, jepa_predictor_checkpoint: str | None = No
     # docstring -- root only comes through if you passed --data.root=... on
     # the CLI, regardless of what's baked into the config registry entry.
     data_config = config.data.create(config.assets_dirs, config.model)
-    if data_config.root is not None:
-        repo_id_or_root = str(data_config.root)
-        is_local_root = True
-    elif data_config.repo_id is not None:
-        if data_config.repo_id.startswith("local/"):
-            # KoboDataConfig-style configs set repo_id to a local-only
-            # placeholder string (e.g. "local/bimanual_cube") that isn't a
-            # real Hub id. Treating it as one would 404 against the Hub with
-            # a confusing error instead of telling you what's actually wrong.
-            raise ValueError(
-                f"config.data.repo_id ('{data_config.repo_id}') looks like a local-only placeholder, "
-                f"not a real Hub repo id, and config.data.root is None. Pass --data.root=/path/to/dataset "
-                f"on the CLI (see the create_base_config bug noted in this file's module docstring)."
-            )
-        repo_id_or_root = data_config.repo_id
-        is_local_root = False
-    else:
-        raise ValueError("config.data resolved to neither a root path nor a repo_id.")
+    repo_id_or_root, is_local_root = resolve_dataset_root(data_config)
 
     action_horizon = config.model.action_horizon
     num_workers = config.num_workers

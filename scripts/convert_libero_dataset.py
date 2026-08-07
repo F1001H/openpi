@@ -29,13 +29,19 @@ This is a ONE-TIME, CPU-only, no-GPU-needed step -- run it once (e.g. via
 slurm/prepare_libero_dataset.slurm on the cluster) and point every
 pi05_libero_low_mem run's --data.root at the resulting directory afterward.
 
-NOT resumable in place: LeRobotDataset.create() requires --out-root to not
-already exist (it's a fresh-write API, not an append one). --start-episode/
---num-episodes exist to let you convert a small slice for a quick sanity
-check (point a throwaway --out-root at just --num-episodes=10, inspect it,
-then delete it and run the real full conversion) -- if a full run dies
-partway through, delete --out-root and rerun from scratch rather than trying
-to resume with --start-episode into the same directory.
+RESUMABLE: if --out-root already exists with a loadable partial dataset
+(i.e. at least one episode's metadata was fully flushed), this script
+reopens it via the plain LeRobotDataset(repo_id=..., root=...) constructor
+-- which lerobot's own recording API supports resuming into, same as
+resuming an interrupted robot data-collection session -- and continues from
+meta.total_episodes instead of restarting at episode 0. metadata_buffer_size
+is set to 1 (flush after every episode, not lerobot's default batch-of-10)
+specifically so a crash never loses more than the ONE episode that was
+in-progress at the time, regardless of when it happens. Re-running the exact
+same command after a crash is the intended recovery path -- no flags to
+change. (--start-episode/--num-episodes are a SEPARATE, unrelated knob: they
+exist to let you convert a small slice for a quick sanity check by pointing
+a throwaway --out-root at just --num-episodes=10.)
 
 Usage:
     uv run scripts/convert_libero_dataset.py \
@@ -48,6 +54,8 @@ import argparse
 import io
 import json
 import logging
+import pathlib
+import shutil
 
 import jsonlines
 import numpy as np
@@ -112,15 +120,56 @@ def main(
     non_image_keys = [k for k in features if k not in image_keys]
     logging.info(f"image_keys={image_keys} other_keys={non_image_keys}")
 
-    ds = LeRobotDataset.create(
-        repo_id=f"local/{repo_id.split('/')[-1]}",
-        fps=fps,
-        features=features,
-        root=out_root,
-        robot_type=robot_type,
-        use_videos=False,
-        image_writer_threads=image_writer_threads,
-    )
+    local_repo_id = f"local/{repo_id.split('/')[-1]}"
+    out_root_path = pathlib.Path(out_root)
+    ds = None
+    # Check the filesystem directly BEFORE ever calling the plain
+    # LeRobotDataset(repo_id=..., root=...) constructor: that constructor
+    # eagerly mkdir()s root, and -- if local metadata fails to load --
+    # falls into ITS OWN internal network-fallback path, which tries to
+    # validate local_repo_id ("local/...", not a real Hub id) against the
+    # Hub and raises RepositoryNotFoundError (a 401, NOT a clean
+    # FileNotFoundError/NotADirectoryError we could catch cleanly). Same
+    # failure family as this session's earlier fix for a fresh empty
+    # out_root -- gate on the real, on-disk signal instead of relying on
+    # the constructor's own exception type.
+    if (out_root_path / "meta" / "info.json").exists():
+        ds = LeRobotDataset(repo_id=local_repo_id, root=out_root)
+        # metadata_buffer_size isn't a constructor kwarg on the plain
+        # LeRobotDataset(...) path (only on .create()) -- it's just a plain
+        # attribute read at flush-decision time (save_episode's
+        # `len(self.metadata_buffer) >= self.metadata_buffer_size` check),
+        # so overriding it directly here is safe and has the same effect.
+        ds.meta.metadata_buffer_size = 1
+        ds.start_image_writer(num_threads=image_writer_threads)
+        if ds.meta.total_episodes > 0:
+            logging.info(f"Resuming existing dataset at {out_root}: {ds.meta.total_episodes} episodes already done.")
+            start_episode = max(start_episode, ds.meta.total_episodes)
+    elif out_root_path.exists():
+        # Exists but no meta/info.json -- either a stray empty dir (e.g.
+        # from a run that crashed before .create() finished, or a leftover
+        # from this branch on a previous attempt) or genuinely unrelated
+        # contents. Nothing resumable is here either way -- .create() below
+        # requires the directory to NOT exist (exist_ok=False), so clear it.
+        logging.info(f"{out_root} exists but has no meta/info.json (nothing resumable) -- clearing it.")
+        shutil.rmtree(out_root_path)
+
+    if ds is None:
+        ds = LeRobotDataset.create(
+            repo_id=local_repo_id,
+            fps=fps,
+            features=features,
+            root=out_root,
+            robot_type=robot_type,
+            use_videos=False,
+            image_writer_threads=image_writer_threads,
+            metadata_buffer_size=1,
+        )
+
+    if start_episode >= end_episode:
+        logging.info(f"Nothing to do: {start_episode} episodes already done, target was {end_episode}.")
+        ds.finalize()
+        return
 
     chunks_size = info.get("chunks_size", 1000)
     for ep_idx in tqdm.tqdm(range(start_episode, end_episode), desc="episodes"):

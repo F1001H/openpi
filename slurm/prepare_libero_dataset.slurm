@@ -16,10 +16,12 @@ set -euo pipefail
 # ONE-TIME step: converts physical-intelligence/libero into a real local
 # v3.0 dataset on shared storage. Run this once before submitting any
 # train_pi05_libero_jepa_sweep.slurm jobs -- they all read from
-# $DATASET_ROOT set here. Safe to re-run: it checks whether $DATASET_ROOT
-# already looks complete and skips if so (delete it first to force a
-# from-scratch reconversion; see convert_libero_dataset.py's docstring on
-# why this isn't resumable in place).
+# $DATASET_ROOT set here. Safe to re-run, including after this job dies/gets
+# preempted partway through: convert_libero_dataset.py resumes from
+# meta.total_episodes on its own (metadata is flushed after every single
+# episode specifically so a crash never loses more than the one episode that
+# was in flight) -- this script just calls it plainly every time rather than
+# trying to duplicate that completeness check here.
 
 REPO_DIR="${REPO_DIR:-$HOME/openpi}"
 SHARED_WS="/mnt/vast/workspaces/VLA_Reinforcement"
@@ -54,12 +56,6 @@ fi
 
 cd "$REPO_DIR"
 mkdir -p slurm/logs
-
-if [ -f "$DATASET_ROOT/meta/info.json" ] && [ -f "$DATASET_ROOT/meta/stats.json" ]; then
-    echo "Dataset already present at $DATASET_ROOT (meta/info.json + meta/stats.json found) -- skipping."
-    echo "Delete $DATASET_ROOT first if you want to force a from-scratch reconversion."
-    exit 0
-fi
 
 uv run scripts/convert_libero_dataset.py \
     --repo-id="$REPO_ID" \

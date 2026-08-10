@@ -47,6 +47,18 @@ import torch
 from torch.utils.data import DataLoader as TorchDataLoader
 from torch.utils.data import IterableDataset
 
+# PyTorch's default ("file_descriptor") multiprocessing sharing strategy
+# passes worker->main-process tensors (image batches, here) through
+# /dev/shm -- on cluster nodes where that's allocated small (common under
+# SLURM/containers), num_workers>0 DataLoaders crash with "Unexpected bus
+# error ... insufficient shared memory (shm)" (SIGBUS) once enough data is
+# in flight. "file_system" instead uses temp files for the same handoff,
+# sidestepping the /dev/shm size entirely -- the standard fix for this exact
+# symptom. Must be set before any DataLoader with workers is constructed,
+# hence at import time here (both JepaTransitionDataLoader and
+# QChunkDataLoader below use TorchDataLoader with num_workers>0 by default).
+torch.multiprocessing.set_sharing_strategy("file_system")
+
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 import openpi.models.model as _model

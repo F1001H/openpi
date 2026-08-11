@@ -12,9 +12,14 @@ set -euo pipefail
 # Extracts servable (plain Pi0Config-shaped) checkpoints for every point in
 # the alpha_bc/beta_jepa sweep (see slurm/submit_libero_jepa_sweep.sh), so
 # they can be rsynced locally and evaluated in the LIBERO sim (see
-# scripts/eval_libero_sweep_local.sh). Each extraction is I/O-bound (restore
-# ~14GB, slice out base_model, write ~7GB) and takes roughly 15-30s -- the
-# whole loop should finish in a few minutes, well within a single short job.
+# scripts/eval_libero_sweep_local.sh). scripts/extract_base_model_checkpoint.py
+# now extracts EVERY surviving checkpoint step per run (not just the latest
+# -- max_to_keep=1 + keep_period=5000 means ~6 steps typically survive a
+# 30k-step run), each written to its own out_dir/<step>/ subdirectory. Each
+# individual extraction is I/O-bound (restore ~14GB, slice out base_model,
+# write ~7GB) and takes roughly 15-30s -- for 5 sweep points x ~6 steps
+# each, expect the whole loop to take on the order of 15-30 minutes, still
+# comfortably a single short job.
 
 REPO_DIR="${REPO_DIR:-$HOME/openpi}"
 SHARED_WS="/mnt/vast/workspaces/VLA_Reinforcement"

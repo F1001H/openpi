@@ -3,7 +3,9 @@
 #SBATCH --partition=all
 #SBATCH --gres=gpu:h100:1                # LoRA config, same 1-GPU footprint as the sweep training runs
 #SBATCH --cpus-per-task=14
-#SBATCH --mem=128G
+#SBATCH --mem=256G                       # proportional 1-GPU share of a node's ~2TB (2TB/8) -- 128G OOM'd
+                                          # (5 oom_kill events, DataLoader workers killed) at num_workers=14,
+                                          # --reward-batch-size=64; also dropped both of those, see below
 #SBATCH --output=slurm/logs/%x-%j.out
 #SBATCH --error=slurm/logs/%x-%j.out
 
@@ -37,7 +39,16 @@ OUTPUT_PATH="${OUTPUT_PATH:-$SHARED_WS/fabian/qc_cache_libero_beta0.1.npz}"
 HORIZON_LENGTH="${HORIZON_LENGTH:-5}"
 ACTION_DIM="${ACTION_DIM:-7}"              # Libero's native action dim (vs kobo's 8)
 NUM_CANDIDATES="${NUM_CANDIDATES:-8}"
-REWARD_BATCH_SIZE="${REWARD_BATCH_SIZE:-64}"
+# Both dropped from an earlier, too-aggressive attempt (num_workers tied to
+# --cpus-per-task=14, --reward-batch-size=64) that OOM'd host memory: each
+# DataLoader worker decodes full (obs_t, obs_t1) transitions through the
+# REAL transform pipeline (repack -> data_transforms -> resize to 224x224 ->
+# padding to model dims), not just raw images -- with prefetch_factor
+# multiplying that across num_workers*batch_size in flight at once, this
+# scales fast. These are conservative-but-still-parallel defaults; raise
+# them only alongside --mem if this still has headroom to spare.
+REWARD_BATCH_SIZE="${REWARD_BATCH_SIZE:-32}"
+NUM_WORKERS="${NUM_WORKERS:-4}"
 
 export HF_HOME="${HF_HOME:-/mnt/vast/workspaces/VLA_Reinforcement/huggingface}"
 export OPENPI_DATA_HOME="${OPENPI_DATA_HOME:-/mnt/vast/workspaces/VLA_Reinforcement/openpi_cache}"
@@ -64,6 +75,6 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/qc_label_rewards.py "$CONFIG_N
     --action-dim="$ACTION_DIM" \
     --num-candidates="$NUM_CANDIDATES" \
     --reward-batch-size="$REWARD_BATCH_SIZE" \
-    --num-workers="${SLURM_CPUS_PER_TASK:-14}"
+    --num-workers="$NUM_WORKERS"
 
 echo "Done. QC reward cache at $OUTPUT_PATH"

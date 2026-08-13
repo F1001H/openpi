@@ -33,10 +33,19 @@ for a 30k-step run with the default keep_period=5000 -- NOT just the
 latest), one subdirectory per step under --out-dir (--out-dir/<step>/
 {params,assets}). Pass --steps to restrict to a subset instead.
 
+--fsdp-devices must match whatever --fsdp-devices the checkpoint was TRAINED
+with (default 1) -- restoring a checkpoint saved under N-way FSDP sharding
+with a mesh built for fewer devices fails outright (orbax: "sharding passed
+to deserialization should be specified, concrete and an instance of
+`jax.sharding.Sharding`. Got None"), and sharding.make_mesh() itself
+requires that many real JAX devices to actually be visible (i.e. the SLURM
+--gres allocation needs to match too, not just this flag).
+
 Usage:
     uv run scripts/extract_base_model_checkpoint.py <config_name> \
         --exp-name=<exp_name> --out-dir=/path/to/servable_checkpoints \
-        [--steps=5000,10000] [--checkpoint-base-dir=./checkpoints]
+        [--steps=5000,10000] [--checkpoint-base-dir=./checkpoints] \
+        [--fsdp-devices=1]
 
 Then serve/evaluate any one of them with:
     uv run scripts/serve_policy.py policy:checkpoint \
@@ -90,9 +99,9 @@ def _extract_one(
     logging.info(f"Wrote servable checkpoint (step {step}) to {out_path}")
 
 
-def main(config: _config.TrainConfig, steps: list[int] | None, out_dir: str) -> None:
+def main(config: _config.TrainConfig, steps: list[int] | None, out_dir: str, fsdp_devices: int) -> None:
     init_logging()
-    mesh = sharding.make_mesh(1)
+    mesh = sharding.make_mesh(fsdp_devices)
     rng = jax.random.key(config.seed)
 
     # Shape inference is cheap (jax.eval_shape, no real I/O) -- build once,
@@ -126,8 +135,12 @@ if __name__ == "__main__":
         help="Comma-separated checkpoint steps to extract (default: every step CheckpointManager still has).",
     )
     _parser.add_argument("--out-dir", type=str, required=True)
+    _parser.add_argument(
+        "--fsdp-devices", type=int, default=1,
+        help="Must match the --fsdp-devices the checkpoint was trained with (see module docstring).",
+    )
     _args, _remaining = _parser.parse_known_args()
     sys.argv = [sys.argv[0]] + _remaining
 
     _steps = [int(s) for s in _args.steps.split(",")] if _args.steps else None
-    main(_config.cli(), _steps, _args.out_dir)
+    main(_config.cli(), _steps, _args.out_dir, _args.fsdp_devices)

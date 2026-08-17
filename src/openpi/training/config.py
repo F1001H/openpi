@@ -703,6 +703,22 @@ class TrainConfig:
     # jepa_stopgrad_vision ablation below.
     alpha_bc: float = 1.0
     beta_jepa: float = 0.5
+    # If set, beta_jepa is no longer held constant: it cosine-decays from
+    # beta_jepa (at step 0) down to beta_jepa_final over beta_jepa_decay_steps
+    # steps, then stays at beta_jepa_final for the rest of training. Motivated
+    # by the LIBERO full-finetune step-level eval breakdown (libero_all_steps_
+    # all_suites_eval_results*.txt): beta_jepa=0.1 tracks or beats the
+    # beta_jepa=0.0 baseline through step ~15000, then falls behind once BC
+    # has mostly converged -- consistent with JEPA's auxiliary gradient being
+    # useful early (while there's still shared representation structure to
+    # learn) and purely competing with BC for capacity late. Decaying beta
+    # tries to capture the early benefit without the late cost, without
+    # needing a second training stage. None (default) preserves the original
+    # constant-beta behavior used by every run so far.
+    beta_jepa_final: float | None = None
+    # Defaults to num_train_steps (decay spans the whole run) if beta_jepa_final
+    # is set but this isn't.
+    beta_jepa_decay_steps: int | None = None
     jepa_loss_exp: float = 2.0
     # If true, stop-gradients the shared SigLIP vision features (PaliGemma.
     # img's output) at the point they enter the JEPA path (before

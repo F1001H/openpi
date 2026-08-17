@@ -276,13 +276,28 @@ def train_step(
         l_jepa = jnp.mean(error_jepa) / loss_exp
 
         alpha = getattr(config, "alpha_bc", 1.0)
-        beta = getattr(config, "beta_jepa", 0.5)
+        beta_init = getattr(config, "beta_jepa", 0.5)
+        beta_final = getattr(config, "beta_jepa_final", None)
+        if beta_final is not None:
+            # Cosine decay beta_init -> beta_final over beta_jepa_decay_steps,
+            # then hold at beta_final. state.step is a traced value (this
+            # jitted train_step is compiled once for the whole run), so the
+            # schedule has to be computed with jnp ops here rather than as a
+            # plain Python float baked in at trace time -- see TrainConfig.
+            # beta_jepa_final's docstring for the motivation.
+            decay_steps = getattr(config, "beta_jepa_decay_steps", None) or config.num_train_steps
+            progress = jnp.clip(state.step / decay_steps, 0.0, 1.0)
+            cosine = 0.5 * (1.0 + jnp.cos(jnp.pi * progress))
+            beta = beta_final + (beta_init - beta_final) * cosine
+        else:
+            beta = beta_init
         total_loss = alpha * l_bc_mean + beta * l_jepa
 
         return total_loss, {
             "loss": total_loss,
             "loss_bc": l_bc_mean,
             "loss_jepa": l_jepa,
+            "beta_jepa": beta,
         }
 
     diff_state = nnx.DiffState(0, config.trainable_filter)

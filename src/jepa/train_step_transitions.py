@@ -290,7 +290,13 @@ def train_step(
             cosine = 0.5 * (1.0 + jnp.cos(jnp.pi * progress))
             beta = beta_final + (beta_init - beta_final) * cosine
         else:
-            beta = beta_init
+            # Cast explicitly: unlike the decay branch (whose jnp ops already
+            # produce a tracer), a constant beta_init is a bare Python float
+            # here, which fails train_step's `-> dict[str, at.Array]` return
+            # annotation once it's put straight into the metrics dict below
+            # (the multiplication into total_loss happened to upcast it
+            # implicitly, masking this for that value alone).
+            beta = jnp.asarray(beta_init)
         total_loss = alpha * l_bc_mean + beta * l_jepa
 
         return total_loss, {

@@ -1,8 +1,18 @@
 #!/bin/bash
 #SBATCH --job-name=pi05_libero_full_finetune_beta_decay
 #SBATCH --partition=all
-#SBATCH --gres=gpu:h100:3                # same footprint as train_pi05_libero_full_finetune.slurm --
+#SBATCH --gres=gpu:h100:4                # same footprint as train_pi05_libero_full_finetune.slurm --
                                           # the schedule only changes a scalar multiplier, not memory usage
+                                          # NOTE: jobs 236634 (req/alloc 4 GPUs, jax saw 2) and 238429 (req/alloc
+                                          # 3, jax saw 1) both hit a GRES/cgroup device-visibility mismatch on
+                                          # shared nodes (238429 shared cn17 with a DIFFERENT user's job) --
+                                          # stopgrad (same 4-GPU footprint) hasn't hit it, so this looks like
+                                          # node-assignment luck rather than something guaranteed to recur.
+                                          # Deliberately NOT using --exclusive here -- it fixes the bug but
+                                          # needs a whole free 8-GPU node, which stacks badly with the
+                                          # AssocGrpGRES queueing already in play. If this fails the same way a
+                                          # third time, --exclusive is the known fix; worth reporting to cluster
+                                          # admins at that point either way.
 #SBATCH --cpus-per-task=56               # 112 CPUs / 8 GPUs per node -- proportional 4-GPU share
 #SBATCH --mem=512G
 #SBATCH --output=slurm/logs/%x-%j.out
@@ -58,7 +68,7 @@ BETA_JEPA_INIT="${BETA_JEPA_INIT:-0.5}"
 BETA_JEPA_FINAL="${BETA_JEPA_FINAL:-0.0}"
 BETA_JEPA_DECAY_STEPS="${BETA_JEPA_DECAY_STEPS:-}"   # empty -> defaults to num_train_steps (see config.py)
 EXP_NAME="${EXP_NAME:-libero_jepa_full_finetune_betadecay_${BETA_JEPA_INIT}to${BETA_JEPA_FINAL}}"
-FSDP_DEVICES="${FSDP_DEVICES:-3}"        # matches --gres above
+FSDP_DEVICES="${FSDP_DEVICES:-4}"        # matches --gres above
 
 cd "$REPO_DIR"
 mkdir -p slurm/logs "$CHECKPOINT_BASE_DIR" "$WANDB_DIR" "$(dirname "$JEPA_NPZ_CKPT")"

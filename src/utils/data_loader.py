@@ -540,6 +540,8 @@ class QChunkTransitionDataset(IterableDataset):
         is_local_root: bool = False,
         shuffle_episodes: bool = True,
         seed: int = 0,
+        alpha_intrinsic: float = 1.0,
+        alpha_goal: float = 0.0,
     ):
         self.config = config
         self.repo_id_or_root = repo_id_or_root
@@ -561,8 +563,27 @@ class QChunkTransitionDataset(IterableDataset):
         self._state_key, self._action_key = _infer_raw_state_action_keys(data_config)
 
         cache = np.load(qc_cache_path)
-        self._rewards_by_episode = {
+        intrinsic_by_episode = {
             int(k.split("_")[1]): cache[k] for k in cache.files if k.startswith("episode_")
+        }
+        # goal_<i>: sparse task-completion reward (scripts/add_goal_reward_to_
+        # qc_cache.py), added to the cache AFTER the (expensive) intrinsic
+        # labeling pass rather than baked into episode_<i> itself, so pure-
+        # intrinsic caches keep working unchanged (alpha_goal=0.0 default,
+        # goal_<i> missing entirely is also fine -- treated as all-zero).
+        # Combined once here (not per-chunk in _get_chunk) since discounted
+        # windowed-sum is linear: alpha*sum(r*d) + beta*sum(g*d) ==
+        # sum((alpha*r + beta*g)*d), so this is exactly equivalent to
+        # combining after windowing, just cheaper (once per episode, not
+        # once per sampled chunk).
+        goal_by_episode = {
+            int(k.split("_")[1]): cache[k] for k in cache.files if k.startswith("goal_")
+        }
+        self._rewards_by_episode = {
+            ep_i: np.float32(alpha_intrinsic) * intrinsic + np.float32(alpha_goal) * goal_by_episode.get(
+                ep_i, np.zeros_like(intrinsic)
+            )
+            for ep_i, intrinsic in intrinsic_by_episode.items()
         }
         self._embeds_by_episode = {
             int(k.split("_")[1]): cache[k] for k in cache.files if k.startswith("embed_")
@@ -747,11 +768,14 @@ class QChunkDataLoader:
         is_local_root: bool = False,
         prefetch: int = 4,
         seed: int = 0,
+        alpha_intrinsic: float = 1.0,
+        alpha_goal: float = 0.0,
     ):
         self.data_sharding = data_sharding
         dataset = QChunkTransitionDataset(
             config, repo_id_or_root, horizon_length, qc_cache_path, discount=discount,
             is_local_root=is_local_root, shuffle_episodes=True, seed=seed,
+            alpha_intrinsic=alpha_intrinsic, alpha_goal=alpha_goal,
         )
         self._torch_loader = TorchDataLoader(
             dataset,

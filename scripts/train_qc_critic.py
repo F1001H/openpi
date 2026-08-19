@@ -63,6 +63,8 @@ def main(
     log_interval: int,
     checkpoint_dir: str | None,
     wandb_enabled: bool,
+    alpha_intrinsic: float = 1.0,
+    alpha_goal: float = 0.0,
 ):
     init_logging()
 
@@ -72,6 +74,7 @@ def main(
             config=dict(
                 horizon_length=horizon_length, discount=discount, tau=tau, lr=lr,
                 num_qs=num_qs, batch_size=batch_size,
+                alpha_intrinsic=alpha_intrinsic, alpha_goal=alpha_goal,
             ),
         )
     else:
@@ -87,6 +90,7 @@ def main(
         config, repo_id_or_root, horizon_length, qc_cache_path,
         data_sharding=data_sharding, batch_size=batch_size, discount=discount,
         num_workers=2, is_local_root=is_local_root,
+        alpha_intrinsic=alpha_intrinsic, alpha_goal=alpha_goal,
     )
     data_iter = iter(loader)
 
@@ -138,6 +142,16 @@ if __name__ == "__main__":
     _parser.add_argument("--log-interval", type=int, default=100)
     _parser.add_argument("--checkpoint-dir", type=str, default=None)
     _parser.add_argument("--no-wandb-enabled", dest="wandb_enabled", action="store_false", default=True)
+    _parser.add_argument(
+        "--alpha-intrinsic", type=float, default=1.0,
+        help="Weight on the JEPA-prediction-error intrinsic reward (episode_<i> in the cache).",
+    )
+    _parser.add_argument(
+        "--alpha-goal", type=float, default=0.0,
+        help="Weight on the sparse task-completion reward (goal_<i> in the cache, added by "
+        "scripts/add_goal_reward_to_qc_cache.py -- 0.0 default means pure-intrinsic, matching every "
+        "critic trained before this flag existed). goal_<i> missing from the cache is treated as all-zero.",
+    )
     _args, _remaining = _parser.parse_known_args()
     sys.argv = [sys.argv[0]] + _remaining
 
@@ -156,4 +170,6 @@ if __name__ == "__main__":
         _args.log_interval,
         _args.checkpoint_dir,
         _args.wandb_enabled,
+        alpha_intrinsic=_args.alpha_intrinsic,
+        alpha_goal=_args.alpha_goal,
     )

@@ -87,6 +87,30 @@ def save_state(
     checkpoint_manager.save(step, items)
 
 
+def _prune_to_structure(actual: nnx.State, expected: nnx.State) -> nnx.State:
+    """Returns a copy of `actual` restricted to exactly the leaf paths
+    present in `expected` -- for reconciling a restored State that may carry
+    EXTRA leaves (e.g. a checkpoint saved before the _split_params fix
+    above, which has non-Param buffers baked into its saved ema_params) back
+    down to what the current abstract shape expects. Operates on
+    flat_state()'s own key representation directly, never round-tripping
+    through to_pure_dict()/replace_by_pure_dict -- that path's
+    try_convert_int silently mismatches int-vs-str keys for list-typed
+    submodules (e.g. jepa_predictor.predictor_blocks), a real bug hit and
+    fixed in scripts/serve_qc_policy.py's _load_full_jepa_model; this avoids
+    the whole class of issue by staying in nnx.State's own key space."""
+    expected_flat = expected.flat_state()
+    actual_flat = actual.flat_state()
+    missing = [k for k in expected_flat if k not in actual_flat]
+    if missing:
+        raise ValueError(
+            f"Restored state is missing {len(missing)} expected leaves (e.g. {missing[:5]}) -- "
+            "checkpoint doesn't match the current model architecture."
+        )
+    pruned_flat = {k: actual_flat[k] for k in expected_flat}
+    return nnx.State.from_flat_path(pruned_flat)
+
+
 def restore_state(
     checkpoint_manager: ocp.CheckpointManager,
     state: training_utils.TrainState,
@@ -105,7 +129,22 @@ def restore_state(
                 "params": {"params": params},
             },
         )
-    return _merge_params(restored["train_state"], restored["params"])
+    merged = _merge_params(restored["train_state"], restored["params"])
+    if state.ema_params is not None and merged.ema_params is not None:
+        # Defense against checkpoints saved before the _split_params fix
+        # above (e.g. stopgrad's step-29000 checkpoint): those have extra
+        # non-Param buffer leaves (attn_mask) baked into the saved params
+        # item, which come back with MORE structure than the abstract
+        # state.ema_params template (built fresh via config.trainable_
+        # filter, always Param-only) expects -- exactly what crashed pjit's
+        # in_shardings structure check on --resume. Prune back down to
+        # match state.ema_params regardless of what orbax actually
+        # returned; for checkpoints saved by the fixed code this is a no-op
+        # (structures already match).
+        merged = dataclasses.replace(
+            merged, ema_params=_prune_to_structure(merged.ema_params, state.ema_params)
+        )
+    return merged
 
 
 def load_norm_stats(assets_dir: epath.Path | str, asset_id: str) -> dict[str, _normalize.NormStats] | None:
@@ -153,10 +192,24 @@ def _split_params(state: training_utils.TrainState) -> tuple[training_utils.Trai
         # whatever's missing from the live/online params. For a full-
         # structure ema_params (the common, non-JEPA case) the key sets
         # already match, so this is a no-op.
+        #
+        # Restrict the "full" side to nnx.Param leaves ONLY -- state.params
+        # also contains non-Param nnx.Variable buffers (e.g. jepa/
+        # ac_predictor_nnx.py's fixed causal attn_mask, or Dropout's RngKey/
+        # RngCount state), which config.trainable_filter (nnx.All(nnx.Param,
+        # ...)) never includes in ema_params in the first place. Filling gaps
+        # from the UNFILTERED state.params blindly pulled those buffers in
+        # too, giving a SAVED ema_params a different (larger) structure than
+        # any FRESHLY-BUILT run's abstract ema_params shape (always Param-
+        # only) -- silent until the next --resume, where pjit's in_shardings
+        # structure check crashes on the mismatch (confirmed: this exact
+        # failure on stopgrad's resume from step 29000, symmetric diff
+        # {'attn_mask'} under ema_params['jepa_predictor']).
+        full_params_only = state.params.filter(nnx.Param)
         ema_keys = set(params.flat_state())
-        full_keys = set(state.params.flat_state())
+        full_keys = set(full_params_only.flat_state())
         if ema_keys != full_keys:
-            full_flat = dict(state.params.flat_state())
+            full_flat = dict(full_params_only.flat_state())
             full_flat.update(dict(params.flat_state()))
             params = nnx.State.from_flat_path(full_flat)
         train_state = dataclasses.replace(state, ema_params=None)

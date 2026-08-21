@@ -1,8 +1,31 @@
 # Data directories.
 assets/
 checkpoints/
+checkpoints_qc/
 data/
 wandb/
+
+# Local Claude Code project notes -- not project source.
+CLAUDE.md
+
+# Large local binary artifacts (pretrained weights, cached datasets/rewards,
+# replay buffers) -- regenerable or downloadable, not project source. No
+# tracked file currently uses these extensions (checked via git ls-files),
+# so this is safe as a blanket rule rather than per-filename entries.
+*.npz
+*.npy
+*.pt
+*.pth
+*.ckpt
+
+# LIBERO sim eval outputs (scripts/eval_libero_sweep_local.sh,
+# scripts/eval_libero_all_suites.sh) -- rollout videos/logs and results
+# summaries, all locally regenerable, not project source.
+libero_eval_videos/
+libero_sweep_eval_results*.txt
+libero_all_suites_eval_results.txt
+libero_all_steps_all_suites_eval_results*.txt
+libero_qc_all_suites_eval_results*.txt
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

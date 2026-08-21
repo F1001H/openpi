@@ -39,17 +39,43 @@ def _rope_freqs(dim: int, theta: float = 10000.0) -> jnp.ndarray:
 
 
 def _apply_rope_1axis(x: jnp.ndarray, pos: jnp.ndarray, freqs: jnp.ndarray) -> jnp.ndarray:
-    """Rotate the last-dim pairs of `x` by angle pos*freqs.
-    x: [..., N, dim] (dim even, restricted to one axis's sub-dimension)
+    """Faithfully reproduces facebookresearch/vjepa2's rotate_queries_or_keys
+    (src/jepa/utils/modules.py), INCLUDING its documented frequency-
+    duplication "bug" (`.repeat(1,1,1,2)`, i.e. tiling the freq/2-length
+    cos/sin bank, NOT `.repeat_interleave(2)`). That file's own comment
+    explains the bug is kept deliberately: "fixing the bug would break
+    compatibility with the pretrained model" -- the real V-JEPA2 checkpoint's
+    Q/K projection weights were trained with this exact (non-standard)
+    rotation baked in, so implementing textbook/"fixed" RoPE here would
+    silently corrupt how those pretrained weights encode position, not fix
+    anything. This was previously implemented as a different, "half-split"
+    convention (x1,x2 = first-half/second-half of x, pairing channel j with
+    j+dim/2) -- INCOMPATIBLE with the reference's ADJACENT-pair convention
+    (channel 2i paired with 2i+1) below; confirmed by direct derivation, not
+    just the "unverified" caveat this file used to carry.
+
+    x: [..., N, dim] (dim even, restricted to one axis's sub-dimension).
+       Adjacent channel pairs (x[2i], x[2i+1]) are rotated together.
     pos: [..., N] integer/float positions for that axis
     freqs: [dim/2] inverse frequency bank
     """
     angles = pos[..., None] * freqs  # [..., N, dim/2]
-    cos = jnp.cos(angles)
-    sin = jnp.sin(angles)
-    x1, x2 = jnp.split(x, 2, axis=-1)  # each [..., N, dim/2]
-    rotated = jnp.concatenate([x1 * cos - x2 * sin, x1 * sin + x2 * cos], axis=-1)
-    return rotated
+    cos_half = jnp.cos(angles)
+    sin_half = jnp.sin(angles)
+    # Tile (concat with itself), NOT interleave -- matches modules.py's
+    # emb_cos/emb_sin.repeat(1, 1, 1, 2) exactly (torch's .repeat tiles the
+    # whole tensor; it does not duplicate each element in place).
+    cos = jnp.concatenate([cos_half, cos_half], axis=-1)  # [..., N, dim]
+    sin = jnp.concatenate([sin_half, sin_half], axis=-1)  # [..., N, dim]
+
+    *lead, n, dim = x.shape
+    x_pairs = x.reshape(*lead, n, dim // 2, 2)
+    x_even = x_pairs[..., 0]  # x[0], x[2], x[4], ... -- modules.py's y1
+    x_odd = x_pairs[..., 1]   # x[1], x[3], x[5], ... -- modules.py's y2
+    # modules.py: y = stack((-y2, y1), dim=-1).flatten(-2)
+    rot = jnp.stack([-x_odd, x_even], axis=-1).reshape(*lead, n, dim)
+
+    return x * cos + rot * sin
 
 
 def build_3d_rope_coords(T: int, H: int, W: int, action_tokens: int) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
@@ -89,15 +115,20 @@ def build_3d_rope_coords(T: int, H: int, W: int, action_tokens: int) -> tuple[jn
 
 def apply_3d_rope(q_or_k: jnp.ndarray, t_idx: jnp.ndarray, h_idx: jnp.ndarray,
                    w_idx: jnp.ndarray, theta: float = 10000.0) -> jnp.ndarray:
-    """q_or_k: [B, num_heads, N, head_dim]. Splits head_dim into three equal
-    chunks for (t, h, w) axes -- ASSUMED equal split; adjust if your checkpoint
-    implies otherwise (e.g. via parity-testing against the original repo)."""
+    """q_or_k: [B, num_heads, N, head_dim]. Splits head_dim into three EQUAL
+    chunks for (t, h, w) axes, matching modules.py's ACRoPEAttention/
+    RoPEAttention exactly: d_dim = h_dim = w_dim = int(2 * ((head_dim // 3) //
+    2)) (head_dim // 3, rounded down to even) -- all three axes get the SAME
+    size, with any leftover channels passed through completely unrotated for
+    ALL THREE axes symmetrically. Previously this instead gave the leftover
+    to the W axis alone (d_w = head_dim - 2*third), which for the real
+    predictor_embed_dim=1024/num_heads=16 configuration (head_dim=64) rotated
+    d_w=24 dims instead of the reference's 20, with zero passthrough instead
+    of the reference's 4 -- a real, confirmed mismatch against the pretrained
+    checkpoint's convention, not just an "assumed equal split" risk."""
     head_dim = q_or_k.shape[-1]
-    third = head_dim // 3
-    # round down to even for valid rope pairing; leftover dims pass through unrotated
-    third = third - (third % 2)
-    d_t, d_h, d_w = third, third, head_dim - 2 * third
-    d_w = d_w - (d_w % 2)
+    d = int(2 * ((head_dim // 3) // 2))
+    d_t, d_h, d_w = d, d, d
     remainder = head_dim - d_t - d_h - d_w
 
     xt, xh, xw, xr = jnp.split(q_or_k, [d_t, d_t + d_h, d_t + d_h + d_w], axis=-1)

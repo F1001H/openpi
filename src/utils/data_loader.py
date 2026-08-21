@@ -245,7 +245,19 @@ class LeRobotV3TransitionIterableDataset(IterableDataset):
             self._cached_dataset = self._build_dataset()
         dataset = self._cached_dataset
 
-        rng = np.random.default_rng(self.seed + worker_id)
+        if getattr(self, "_rng", None) is None:
+            # Created ONCE and persisted across __iter__ calls (one call per
+            # epoch, since persistent_workers=True keeps this same object
+            # alive for the whole training run) -- matches openpi.training.
+            # data_loader.TorchDataLoader, which builds its torch.Generator
+            # once in __init__ and lets RandomSampler advance its state each
+            # epoch. A fresh `np.random.default_rng(self.seed + worker_id)`
+            # created inside __iter__ every time (the previous behavior)
+            # reseeds identically every epoch, silently replaying the exact
+            # same episode/frame order for the entire run instead of
+            # reshuffling.
+            self._rng = np.random.default_rng(self.seed + worker_id)
+        rng = self._rng
         episode_order = np.arange(self.num_episodes)
         if self.shuffle_episodes:
             rng.shuffle(episode_order)
@@ -640,7 +652,12 @@ class QChunkTransitionDataset(IterableDataset):
         dataset = self._cached_dataset
         slim_hf_dataset = self._cached_slim_hf
 
-        rng = np.random.default_rng(self.seed + worker_id)
+        if getattr(self, "_rng", None) is None:
+            # See LeRobotV3TransitionIterableDataset.__iter__'s identical fix
+            # for why this must be created once and persisted, not recreated
+            # fresh every epoch.
+            self._rng = np.random.default_rng(self.seed + worker_id)
+        rng = self._rng
         episode_order = np.arange(self.num_episodes)
         if self.shuffle_episodes:
             rng.shuffle(episode_order)

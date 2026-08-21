@@ -36,6 +36,7 @@ def best_of_n_action_batch(
     q_agg: str = "mean",
     uncertainty_penalty: float = 0.0,
     actor_disagreement_penalty: float = 0.0,
+    critic_weight: float = 1.0,
     maximize_score: bool = False,
     selection_mode: str = "score",
 ) -> jnp.ndarray:
@@ -93,9 +94,16 @@ def best_of_n_action_batch(
     # uncertainty_penalty=0.0 (default) reduces to plain argmin(q).
     # actor_disagreement_penalty stacks the actor-side term on top of the
     # critic-side ones -- all three are independently weighted, so any
-    # subset can be zeroed out to isolate its effect.
+    # subset can be zeroed out to isolate its effect. critic_weight scales
+    # the critic's own q term specifically -- default 1.0 (unchanged
+    # behavior); critic_weight=0.0 drops the critic out of selection
+    # entirely, isolating what --actor-disagreement-penalty alone does (was
+    # the critic's q contributing anything on top of "prefer the most
+    # consensus/least-outlier candidate the actor itself proposed", or was
+    # the actor-disagreement term already doing all the work in the
+    # argmax+actor-disagree result that beat plain BC?).
     score = (
-        q.reshape(batch_size, num_samples)
+        critic_weight * q.reshape(batch_size, num_samples)
         + uncertainty_penalty * disagreement.reshape(batch_size, num_samples)
         + actor_disagreement_penalty * actor_disagreement
     )

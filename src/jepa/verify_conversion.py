@@ -28,7 +28,9 @@ def verify_conversion(ckpt_path: str):
     print("Converting and injecting weights into NNX graph...")
     # This runs your conversion function to populate the model in-place
     model = convert(model, torch_state, dry_run=False)
-    model.train(False)  # CRITICAL: Freeze stochastic layers/dropout
+    # No PyTorch-style train(bool) toggle in flax NNX -- determinism is
+    # controlled per-call via __call__(..., deterministic=True), which the
+    # forward pass below already relies on (its default).
 
     # ---------------------------------------------------------
     # VERIFICATION 1: Weight Summary Sanity Check
@@ -64,9 +66,18 @@ def verify_conversion(ckpt_path: str):
     # Generate static dummy inputs (matching ViT-g token shapes)
     # batch=2, tokens=64 (example context size), embed_dim=1408
     np.random.seed(42)
-    dummy_z_context = jnp.array(np.random.normal(size=(2, 64, 1408)).astype(np.float32))
-    dummy_actions = jnp.array(np.random.normal(size=(2, 14)).astype(np.float32))
-    dummy_states = jnp.array(np.random.normal(size=(2, 14)).astype(np.float32))
+    # N_ctxt must be T * grid_height * grid_width for __call__'s `T = N_ctxt //
+    # (grid_height * grid_width)` + reshape to divide evenly -- with img_size=
+    # (256,256), patch_size=16 (both fixed above), grid_height=grid_width=16,
+    # so one frame (T=1) is 256 tokens, not the previous (inconsistent, never
+    # actually exercised) 64. actions/states are [B, T, action_embed_dim] (one
+    # vector per T=num_frames timestep, not a single flat vector);
+    # action_embed_dim=7 matches this model's default (never overridden
+    # above) and this project's real LIBERO action_dim.
+    T_dummy = 1
+    dummy_z_context = jnp.array(np.random.normal(size=(2, T_dummy * 16 * 16, 1408)).astype(np.float32))
+    dummy_actions = jnp.array(np.random.normal(size=(2, T_dummy, 7)).astype(np.float32))
+    dummy_states = jnp.array(np.random.normal(size=(2, T_dummy, 7)).astype(np.float32))
 
     try:
         # Run a forward pass

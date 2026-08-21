@@ -139,6 +139,7 @@ class QCPolicy(_base_policy.BasePolicy):
         checkpoint_dir: str | None = None,
         uncertainty_penalty: float = 0.0,
         actor_disagreement_penalty: float = 0.0,
+        critic_weight: float = 1.0,
         maximize_score: bool = False,
         selection_mode: str = "score",
         num_qs: int = 2,
@@ -148,6 +149,7 @@ class QCPolicy(_base_policy.BasePolicy):
         self.action_dim = action_dim
         self.uncertainty_penalty = uncertainty_penalty
         self.actor_disagreement_penalty = actor_disagreement_penalty
+        self.critic_weight = critic_weight
         self.maximize_score = maximize_score
         self.selection_mode = selection_mode
 
@@ -259,6 +261,7 @@ class QCPolicy(_base_policy.BasePolicy):
                 self.norm_stats, use_quantile_norm=self.use_quantile_norm,
                 uncertainty_penalty=self.uncertainty_penalty,
                 actor_disagreement_penalty=self.actor_disagreement_penalty,
+                critic_weight=self.critic_weight,
                 maximize_score=self.maximize_score,
                 selection_mode=self.selection_mode,
             )
@@ -300,6 +303,7 @@ def main(
     checkpoint_dir: str | None = None,
     uncertainty_penalty: float = 0.0,
     actor_disagreement_penalty: float = 0.0,
+    critic_weight: float = 1.0,
     maximize_score: bool = False,
     selection_mode: str = "score",
     num_qs: int = 2,
@@ -308,8 +312,8 @@ def main(
     policy = QCPolicy(
         config, step, critic_checkpoint_path, num_samples, horizon_length, proprio_dim, action_dim, default_prompt,
         fsdp_devices=fsdp_devices, checkpoint_dir=checkpoint_dir, uncertainty_penalty=uncertainty_penalty,
-        actor_disagreement_penalty=actor_disagreement_penalty, maximize_score=maximize_score,
-        selection_mode=selection_mode, num_qs=num_qs,
+        actor_disagreement_penalty=actor_disagreement_penalty, critic_weight=critic_weight,
+        maximize_score=maximize_score, selection_mode=selection_mode, num_qs=num_qs,
     )
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)
@@ -349,6 +353,13 @@ if __name__ == "__main__":
         "to what the BC actor itself mostly proposed here.",
     )
     _parser.add_argument(
+        "--critic-weight", type=float, default=1.0,
+        help="Scales the critic's own q term in the selection score. 1.0 (default) is unchanged behavior; 0.0 "
+        "drops the critic out of selection entirely, isolating what --actor-disagreement-penalty alone does "
+        "(does the critic's q contribute anything on top of picking the most consensus/least-outlier candidate "
+        "the actor itself proposed?).",
+    )
+    _parser.add_argument(
         "--maximize-score", action="store_true", default=False,
         help="Select argmax instead of the default argmin over the (possibly uncertainty-penalized) predicted "
         "JEPA prediction-error score -- restores the original (pre-fix) best-of-N direction. Off by default; "
@@ -384,6 +395,7 @@ if __name__ == "__main__":
         checkpoint_dir=_args.checkpoint_dir,
         uncertainty_penalty=_args.uncertainty_penalty,
         actor_disagreement_penalty=_args.actor_disagreement_penalty,
+        critic_weight=_args.critic_weight,
         maximize_score=_args.maximize_score,
         selection_mode=_args.selection_mode,
         num_qs=_args.num_qs,

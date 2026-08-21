@@ -127,6 +127,31 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+def _task_index_to_prompt_map(tasks) -> dict[int, str]:
+    """Normalizes LeRobotDatasetMetadata.tasks into a plain {task_index:
+    task_string} dict for PromptFromLeRobotTask (typed dict[int, str]).
+
+    The lerobot version installed here stores `meta.tasks` as a pandas
+    DataFrame indexed BY TASK STRING with a "task_index" column -- the
+    REVERSE of what's needed. Passing that DataFrame straight through (the
+    previous behavior) doesn't crash at construction time -- it fails
+    silently later: dict-like `.get(task_index)` on a DataFrame looks up a
+    COLUMN name, not a row in the index, so `self.tasks.get(25)` returns
+    None regardless of which task_index is queried, not just 25 specifically.
+    Confirmed via a real crash training pi05_libero with plain scripts/
+    train.py -- this path was apparently never actually exercised against
+    physical-intelligence/libero before now, since every prior LIBERO run in
+    this repo went through src/utils/data_loader.py's JepaTransitionDataLoader
+    instead, which reads each item's task string directly and never uses
+    this index->string lookup at all."""
+    if isinstance(tasks, dict):
+        return tasks
+    if hasattr(tasks, "columns") and "task_index" in tasks.columns:
+        return dict(zip(tasks["task_index"], tasks.index, strict=True))
+    # Older lerobot convention: a Series/mapping already keyed by task_index.
+    return dict(tasks.items())
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -147,7 +172,9 @@ def create_torch_dataset(
     )
 
     if data_config.prompt_from_task:
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+        dataset = TransformedDataset(
+            dataset, [_transforms.PromptFromLeRobotTask(_task_index_to_prompt_map(dataset_meta.tasks))]
+        )
 
     return dataset
 

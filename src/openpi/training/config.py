@@ -93,6 +93,18 @@ class DataConfig:
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
+    # Fraction of each task's episodes to train on (1.0 = all). Subsampling
+    # is STRATIFIED BY TASK (see openpi.training.data_loader._select_episodes_
+    # by_fraction) -- a global random fraction of all episodes risks dropping
+    # some tasks entirely at low fractions, confounding "less data per task"
+    # with "less task coverage". Only honored by create_torch_dataset (the
+    # plain scripts/train.py path); the JEPA/QC pipeline's own JepaTransition
+    # DataLoader does not read this field. Norm stats are NOT recomputed per
+    # fraction -- intentionally held fixed (computed from the full dataset)
+    # so a sample-efficiency sweep isn't also comparing different
+    # normalization statistics between conditions.
+    episode_fraction: float = 1.0
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
@@ -177,6 +189,9 @@ class DataConfigFactory(abc.ABC):
     # Base config that will be updated by the factory.
     base_config: tyro.conf.Suppress[DataConfig | None] = None
 
+    # See DataConfig.episode_fraction's docstring.
+    episode_fraction: float = 1.0
+
     @abc.abstractmethod
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         """Create a data config."""
@@ -192,6 +207,7 @@ class DataConfigFactory(abc.ABC):
             root=root_path,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
+            episode_fraction=self.episode_fraction,
         )
 
     def _load_norm_stats(self, assets_dir: epath.Path, asset_id: str | None) -> dict[str, _transforms.NormStats] | None:

@@ -152,6 +152,30 @@ def _task_index_to_prompt_map(tasks) -> dict[int, str]:
     return dict(tasks.items())
 
 
+def _select_episodes_by_fraction(dataset_meta, fraction: float, seed: int = 0) -> list[int]:
+    """Stratified-by-task episode subsampling for the sample-efficiency
+    sweep (DataConfig.episode_fraction): for EACH task, keeps `fraction` of
+    that task's own episodes (rounded up to at least 1 -- never fully drops
+    a task), instead of taking a global random fraction of all episodes.
+    A global random fraction risks a task getting zero episodes at low
+    fractions purely by chance, which would confound "less data per task"
+    (what the sweep is meant to measure) with "less task coverage"."""
+    rng = np.random.default_rng(seed)
+    tasks_col = dataset_meta.episodes["tasks"]  # list of lists, one per episode
+    by_task: dict[str, list[int]] = {}
+    for ep_idx, tasks in enumerate(tasks_col):
+        key = tasks[0] if tasks else ""
+        by_task.setdefault(key, []).append(ep_idx)
+    selected: list[int] = []
+    for eps in by_task.values():
+        eps = list(eps)
+        rng.shuffle(eps)
+        k = max(1, round(len(eps) * fraction))
+        selected.extend(eps[:k])
+    selected.sort()
+    return selected
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -161,11 +185,21 @@ def create_torch_dataset(
         raise ValueError("Repo ID is not set. Cannot create dataset.")
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
-    
+
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, data_config.root)
+
+    episodes = None
+    if data_config.episode_fraction < 1.0:
+        episodes = _select_episodes_by_fraction(dataset_meta, data_config.episode_fraction, seed=0)
+        logging.info(
+            f"episode_fraction={data_config.episode_fraction}: training on {len(episodes)}/"
+            f"{dataset_meta.total_episodes} episodes (stratified by task)"
+        )
+
     dataset = lerobot_dataset.LeRobotDataset(
         repo_id=data_config.repo_id,
         root=data_config.root,
+        episodes=episodes,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },

@@ -974,6 +974,16 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
+        # Default keep_period (5000) retains 6 checkpoints across a 30k-step
+        # run (5k/10k/.../25k/29999) -- halved to cut long-term disk usage
+        # on the shared /mnt/vast quota (hit EDQUOT mid-training once
+        # already with 7+ concurrent full-finetune runs each retaining 6).
+        # save_interval (still the class default, 1000) is unrelated to
+        # this -- it only controls transient write/resume granularity;
+        # orbax garbage-collects any save that isn't the latest or aligned
+        # to keep_period, so keep_period is what actually determines
+        # steady-state disk usage.
+        keep_period=10_000,
     ),
     #
     # Fine-tuning Aloha configs.

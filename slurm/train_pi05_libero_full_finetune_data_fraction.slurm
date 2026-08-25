@@ -4,6 +4,12 @@
 #SBATCH --gres=gpu:h100:4                # same footprint as train_pi05_libero_full_finetune_plain_control.slurm
 #SBATCH --cpus-per-task=56               # 112 CPUs / 8 GPUs per node -- proportional 4-GPU share
 #SBATCH --mem=512G
+#SBATCH --exclude=cn02,cn17              # cn17: confirmed broken. cn02: intermittently can't reach its
+                                          # storage, which manifested as a mid-training CUDA/NCCL OOM here
+                                          # (the plain_control and all 3 data-fraction jobs crashed on cn02
+                                          # the same way). Override on the sbatch command line if these get
+                                          # fixed later -- a command-line --exclude= overrides this directive,
+                                          # it doesn't merge with it.
 #SBATCH --output=slurm/logs/%x-%j.out
 #SBATCH --error=slurm/logs/%x-%j.out
 

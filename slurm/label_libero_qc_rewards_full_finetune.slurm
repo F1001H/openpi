@@ -9,6 +9,8 @@
 #SBATCH --mem=256G                       # same host-RAM budget as the LoRA version (label_libero_qc_rewards.slurm)
                                           # -- the OOM there was from DataLoader workers on host RAM, not GPU
                                           # count, so this doesn't need to scale with --gres
+#SBATCH --exclude=cn02,cn17              # cn17: confirmed broken. cn02: intermittently can't reach its
+                                          # storage. Override on the sbatch command line if these get fixed.
 #SBATCH --output=slurm/logs/%x-%j.out
 #SBATCH --error=slurm/logs/%x-%j.out
 

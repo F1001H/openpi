@@ -16,11 +16,18 @@ set -euo pipefail
 # checkpoint for train_pi05_libero_full_finetune_plain_control.slurm's run
 # (plain scripts/train.py, no JEPA/QC code at all) so it can be rsynced
 # locally and compared against beta0.0/beta0.1/stopgrad/betadecay via
-# eval_libero_all_steps_all_suites.sh. This run has no JEPA wrapper to strip
-# (unlike the beta0.0/beta0.1/stopgrad/betadecay runs, which go through
-# OpenPIWithJEPA even at beta_jepa=0.0), but STILL needs this step: the raw
-# checkpoint was saved under 4-way FSDP sharding (--fsdp-devices=4, matching
-# --gres above) and can't be restored on a single local GPU without it.
+# eval_libero_all_steps_all_suites.sh.
+#
+# Uses scripts/extract_plain_checkpoint.py, NOT extract_base_model_
+# checkpoint.py -- confirmed via a real crash that the latter fails here:
+# it builds its abstract restore shape via train_end_to_end.py's
+# OpenPIWithJEPA-wrapped init_train_state and unconditionally indexes
+# ["base_model"], both wrong for a run with no JEPA wrapper at all (this
+# run's on-disk checkpoint params ARE the bare model tree already). Still
+# needs this extraction step regardless of the wrapper question: the raw
+# checkpoint was saved under 4-way FSDP sharding (--fsdp-devices=4,
+# matching --gres above) and can't be restored on a single local GPU
+# without it.
 
 REPO_DIR="${REPO_DIR:-$HOME/openpi}"
 SHARED_WS="/mnt/vast/workspaces/VLA_Reinforcement"
@@ -36,7 +43,7 @@ export OPENPI_DATA_HOME="${OPENPI_DATA_HOME:-/mnt/vast/workspaces/VLA_Reinforcem
 cd "$REPO_DIR"
 mkdir -p slurm/logs "$OUT_DIR"
 
-uv run scripts/extract_base_model_checkpoint.py "$CONFIG_NAME" \
+uv run scripts/extract_plain_checkpoint.py "$CONFIG_NAME" \
     --exp-name="$EXP_NAME" \
     --checkpoint-base-dir="$CHECKPOINT_BASE_DIR" \
     --out-dir="$OUT_DIR" \

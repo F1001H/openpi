@@ -24,6 +24,13 @@ set -euo pipefail
 # 3 variants defaulting to the same path, clobbering each other) doesn't
 # repeat here.
 #
+# Uses scripts/extract_plain_checkpoint.py, NOT extract_base_model_
+# checkpoint.py -- the latter assumes every checkpoint is OpenPIWithJEPA-
+# wrapped (true for beta0.0/beta0.1/stopgrad/betadecay, NOT true here) and
+# crashes on restore. See extract_libero_full_finetune_plain_control_
+# checkpoint.slurm's identical note -- same underlying bug, same fix,
+# confirmed via a real crash extracting plain_control this way.
+#
 # Usage: EPISODE_FRACTION=0.1 sbatch slurm/extract_libero_full_finetune_data_fraction_checkpoint.slurm
 
 REPO_DIR="${REPO_DIR:-$HOME/openpi}"
@@ -41,7 +48,7 @@ export OPENPI_DATA_HOME="${OPENPI_DATA_HOME:-/mnt/vast/workspaces/VLA_Reinforcem
 cd "$REPO_DIR"
 mkdir -p slurm/logs "$OUT_DIR"
 
-uv run scripts/extract_base_model_checkpoint.py "$CONFIG_NAME" \
+uv run scripts/extract_plain_checkpoint.py "$CONFIG_NAME" \
     --exp-name="$EXP_NAME" \
     --checkpoint-base-dir="$CHECKPOINT_BASE_DIR" \
     --out-dir="$OUT_DIR" \

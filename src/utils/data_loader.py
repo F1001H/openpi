@@ -45,7 +45,7 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 from torch.utils.data import DataLoader as TorchDataLoader
-from torch.utils.data import IterableDataset
+from torch.utils.data import Dataset
 
 # PyTorch's default ("file_descriptor") multiprocessing sharing strategy
 # passes worker->main-process tensors (image batches, here) through
@@ -181,13 +181,37 @@ def _build_transform_stages(config: _config.TrainConfig):
 
 
 # --------------------------------------------------------------------------- #
-# 3. Episode-shuffled streaming dataset
+# 3. Flat, map-style transition dataset
 # --------------------------------------------------------------------------- #
 
-class LeRobotV3TransitionIterableDataset(IterableDataset):
-    """Streams (obs_t, obs_t1) raw-but-transformed dict samples, shuffled at
-    the episode level, filtering out each episode's last frame (no valid t+1
-    there). Memory footprint is O(num_episodes), not O(num_frames)."""
+class LeRobotV3TransitionDataset(Dataset):
+    """Map-style dataset of (obs_t, obs_t1) raw-but-transformed dict samples,
+    filtering out each episode's last frame (no valid t+1 there). A flat
+    index across all episodes is built ONCE at construction (O(num_episodes)
+    memory, not O(num_frames) -- only (episode, local_idx, global_idx)
+    tuples are stored, not the frames themselves).
+
+    Deliberately map-style, not IterableDataset (the previous design):
+    LeRobotDataset is already random-access (delta_timestamps windowing
+    works identically regardless of access pattern -- it's exactly what
+    openpi.training.data_loader's reference loader itself relies on), so
+    there's no technical reason to stream. The previous IterableDataset
+    design shuffled at the episode level and streamed each episode's frames
+    to exhaustion before moving to the next -- with num_workers=8, PyTorch's
+    per-item round-robin across workers meant a batch of 256 drew from only
+    ~8-16 distinct episodes (whichever few episodes each worker happened to
+    be mid-stream through), not up to 256. Confirmed as a real, measurable
+    cost this session: a plain-scripts/train.py control run (standard
+    map-style loader, true global shuffling) scored 95.75% avg on LIBERO
+    vs. this file's best JEPA-co-trained checkpoint at 92.0%, even after
+    fixing this file's OTHER bug (RNG recreated fresh every epoch instead of
+    persisted -- see git history). Going map-style hands shuffling entirely
+    to TorchDataLoader's own shuffle=True + persisted torch.Generator
+    (JepaTransitionDataLoader/QChunkDataLoader below), matching the
+    reference loader's mixing exactly instead of approximating it, and
+    deletes the custom per-worker RNG/sharding logic that produced both
+    bugs rather than patching around it again.
+    """
 
     def __init__(
         self,
@@ -196,15 +220,11 @@ class LeRobotV3TransitionIterableDataset(IterableDataset):
         action_horizon: int,
         camera_keys: Optional[list[str]] = None,
         is_local_root: bool = False,
-        shuffle_episodes: bool = True,
-        seed: int = 0,
     ):
         self.config = config
         self.repo_id_or_root = repo_id_or_root
         self.action_horizon = action_horizon
         self.is_local_root = is_local_root
-        self.shuffle_episodes = shuffle_episodes
-        self.seed = seed
 
         meta = _load_meta(repo_id_or_root, is_local_root)
         self.fps = meta.fps
@@ -212,7 +232,19 @@ class LeRobotV3TransitionIterableDataset(IterableDataset):
         self.episode_ranges = _episode_frame_ranges(meta)
         self.num_episodes = len(self.episode_ranges)
         self.total_frames = int(sum(to - frm for frm, to in self.episode_ranges))
-        self.approx_valid_samples = max(0, self.total_frames - self.num_episodes)
+
+        # (ep_i, local_idx, global_idx) per valid sample -- local_idx is the
+        # position within the episode (0-based), global_idx is what
+        # LeRobotDataset.__getitem__ actually indexes with. Exposed as a
+        # public attribute: callers that need per-sample (episode, position)
+        # bookkeeping (e.g. scripts/qc_label_rewards.py's cache scatter) can
+        # read self.index[flat_idx] directly rather than this class needing
+        # to smuggle it through the returned sample dict.
+        self.index: list[tuple[int, int, int]] = []
+        for ep_i, (frm, to) in enumerate(self.episode_ranges):
+            for local_idx in range(to - frm - 1):
+                self.index.append((ep_i, local_idx, frm + local_idx))
+        self.approx_valid_samples = len(self.index)  # exact now, kept for compatibility
 
         # Transform pipeline construction is cheap (Python objects + one
         # norm_stats JSON read via config.data.create), unlike the heavy
@@ -222,8 +254,8 @@ class LeRobotV3TransitionIterableDataset(IterableDataset):
         )
         self._state_key, self._action_key = _infer_raw_state_action_keys(self.data_config)
 
-    def __len__(self):
-        return self.approx_valid_samples
+    def __len__(self) -> int:
+        return len(self.index)
 
     def _build_dataset(self) -> LeRobotDataset:
         step = 1.0 / self.fps
@@ -236,42 +268,18 @@ class LeRobotV3TransitionIterableDataset(IterableDataset):
         kwargs = {"root": self.repo_id_or_root, "repo_id": self.repo_id_or_root} if self.is_local_root else {"repo_id": self.repo_id_or_root}
         return LeRobotDataset(delta_timestamps=delta_timestamps, **kwargs)
 
-    def __iter__(self) -> Iterator[dict]:
-        worker_info = torch.utils.data.get_worker_info()
-        worker_id = worker_info.id if worker_info is not None else 0
-        num_workers = worker_info.num_workers if worker_info is not None else 1
-
+    def __getitem__(self, flat_idx: int) -> dict:
+        # Lazily built per-worker-process (each of num_workers>0's worker
+        # processes gets its own copy of self via fork/spawn at DataLoader
+        # startup, then calls __getitem__ directly -- unlike the old
+        # __iter__ design, PyTorch handles index sharding across workers
+        # itself for a map-style dataset, no manual worker_id::num_workers
+        # slicing needed here anymore) -- the heavy video-decoder-backed
+        # LeRobotDataset shouldn't cross a process fork.
         if getattr(self, "_cached_dataset", None) is None:
             self._cached_dataset = self._build_dataset()
-        dataset = self._cached_dataset
-
-        if getattr(self, "_rng", None) is None:
-            # Created ONCE and persisted across __iter__ calls (one call per
-            # epoch, since persistent_workers=True keeps this same object
-            # alive for the whole training run) -- matches openpi.training.
-            # data_loader.TorchDataLoader, which builds its torch.Generator
-            # once in __init__ and lets RandomSampler advance its state each
-            # epoch. A fresh `np.random.default_rng(self.seed + worker_id)`
-            # created inside __iter__ every time (the previous behavior)
-            # reseeds identically every epoch, silently replaying the exact
-            # same episode/frame order for the entire run instead of
-            # reshuffling.
-            self._rng = np.random.default_rng(self.seed + worker_id)
-        rng = self._rng
-        episode_order = np.arange(self.num_episodes)
-        if self.shuffle_episodes:
-            rng.shuffle(episode_order)
-        episode_order = episode_order[worker_id::num_workers]
-
-        for ep_i in episode_order:
-            frm, to = self.episode_ranges[int(ep_i)]
-            if to - frm < 2:
-                continue
-            local_indices = np.arange(frm, to - 1)
-            if self.shuffle_episodes:
-                rng.shuffle(local_indices)
-            for global_idx in local_indices:
-                yield self._get_transition(dataset, int(global_idx))
+        _, _, global_idx = self.index[flat_idx]
+        return self._get_transition(self._cached_dataset, global_idx)
 
     def _get_transition(self, dataset: LeRobotDataset, real_idx: int) -> dict:
         item = dataset[real_idx]
@@ -415,17 +423,26 @@ class JepaTransitionDataLoader:
     ):
         self.config = config
         self.data_sharding = data_sharding
-        dataset = LeRobotV3TransitionIterableDataset(
+        dataset = LeRobotV3TransitionDataset(
             config, repo_id_or_root, action_horizon, camera_keys=camera_keys,
-            is_local_root=is_local_root, shuffle_episodes=True, seed=seed,
+            is_local_root=is_local_root,
         )
-        # LeRobotV3TransitionIterableDataset already built the real DataConfig
-        # (via config.data.create(...), see _build_transform_stages) to derive
+        # LeRobotV3TransitionDataset already built the real DataConfig (via
+        # config.data.create(...), see _build_transform_stages) to derive
         # its transform pipeline -- reuse it here rather than rebuilding, so
         # data_config() (required by the openpi.training.data_loader.DataLoader
         # Protocol that checkpoints.save_state's save_assets callback expects)
         # returns the exact same norm_stats/asset_id the transforms were built from.
         self._data_config = dataset.data_config
+        # shuffle=True + a persisted torch.Generator matches openpi.training.
+        # data_loader.TorchDataLoader's own convention exactly (see that
+        # file's identical generator.manual_seed(seed) pattern) -- true
+        # global random sampling across ALL episodes per batch, and genuine
+        # epoch-to-epoch reshuffling via the generator's own advancing state.
+        # Map-style + multi-worker means PyTorch shards indices across
+        # workers itself; no manual worker_id::num_workers slicing needed.
+        generator = torch.Generator()
+        generator.manual_seed(seed)
         self._torch_loader = TorchDataLoader(
             dataset,
             batch_size=batch_size,
@@ -433,6 +450,8 @@ class JepaTransitionDataLoader:
             collate_fn=_collate,
             drop_last=True,
             persistent_workers=num_workers > 0,
+            shuffle=True,
+            generator=generator,
         )
         self._queue: "queue.Queue" = queue.Queue(maxsize=prefetch)
         self._stop = threading.Event()
@@ -536,11 +555,15 @@ def _get_item_no_video(dataset: LeRobotDataset, slim_hf_dataset, idx: int) -> di
     return item
 
 
-class QChunkTransitionDataset(IterableDataset):
+class QChunkTransitionDataset(Dataset):
     """Streams (embed_t, proprio_t, action_chunk, chunk_reward, embed_th,
     proprio_th, chunk_mask) samples, shuffled at the episode level.
-    h = horizon_length. Does NOT use LeRobotV3TransitionIterableDataset's
-    image/transform pipeline at all -- see module docstring above."""
+    h = horizon_length. Map-style, not IterableDataset -- see
+    LeRobotV3TransitionDataset's docstring for why (identical reasoning:
+    true global shuffling via TorchDataLoader's own shuffle=True instead of
+    approximating it with per-worker episode streaming). Does NOT use
+    LeRobotV3TransitionDataset's image/transform pipeline at all -- see
+    module docstring above."""
 
     def __init__(
         self,
@@ -550,8 +573,6 @@ class QChunkTransitionDataset(IterableDataset):
         qc_cache_path: str,
         discount: float = 0.99,
         is_local_root: bool = False,
-        shuffle_episodes: bool = True,
-        seed: int = 0,
         alpha_intrinsic: float = 1.0,
         alpha_goal: float = 0.0,
     ):
@@ -560,16 +581,14 @@ class QChunkTransitionDataset(IterableDataset):
         self.horizon_length = horizon_length
         self.discount = discount
         self.is_local_root = is_local_root
-        self.shuffle_episodes = shuffle_episodes
-        self.seed = seed
 
         meta = _load_meta(repo_id_or_root, is_local_root)
         self.fps = meta.fps
         self.episode_ranges = _episode_frame_ranges(meta)
         self.num_episodes = len(self.episode_ranges)
 
-        # See LeRobotV3TransitionIterableDataset's identical use of this --
-        # only built to read off the raw state/action column names, then
+        # See LeRobotV3TransitionDataset's identical use of this -- only
+        # built to read off the raw state/action column names, then
         # discarded (this class does NOT use the transform pipeline itself).
         data_config = config.data.create(config.assets_dirs, config.model)
         self._state_key, self._action_key = _infer_raw_state_action_keys(data_config)
@@ -625,6 +644,21 @@ class QChunkTransitionDataset(IterableDataset):
                 "with scripts/qc_label_rewards.py?"
             )
 
+        # Flat (ep_i, local_idx) index across all episodes, built once here
+        # (needs self._rewards_by_episode, just populated above, since
+        # n_valid depends on the cache's own per-episode length, not
+        # episode_ranges directly -- see the identical n_valid comment this
+        # used to carry in __iter__, now on the loop below).
+        self.index: list[tuple[int, int]] = []
+        for ep_i in range(self.num_episodes):
+            n_valid = len(self._rewards_by_episode[ep_i]) - self.horizon_length
+            if n_valid <= 0:
+                continue
+            self.index.extend((ep_i, local_idx) for local_idx in range(n_valid))
+
+    def __len__(self) -> int:
+        return len(self.index)
+
     def _build_dataset(self) -> LeRobotDataset:
         # Only the raw state/action columns are ever accessed by _get_chunk
         # below -- no camera columns in delta_timestamps, and image columns
@@ -641,51 +675,22 @@ class QChunkTransitionDataset(IterableDataset):
         kwargs = {"root": self.repo_id_or_root, "repo_id": self.repo_id_or_root} if self.is_local_root else {"repo_id": self.repo_id_or_root}
         return LeRobotDataset(delta_timestamps=delta_timestamps, **kwargs)
 
-    def __iter__(self) -> Iterator[dict]:
-        worker_info = torch.utils.data.get_worker_info()
-        worker_id = worker_info.id if worker_info is not None else 0
-        num_workers = worker_info.num_workers if worker_info is not None else 1
-
+    def __getitem__(self, flat_idx: int) -> dict:
+        # Lazily built per-worker-process -- see LeRobotV3TransitionDataset.
+        # __getitem__'s identical note.
         if getattr(self, "_cached_dataset", None) is None:
             self._cached_dataset = self._build_dataset()
             self._cached_slim_hf = _get_slim_hf_dataset(self._cached_dataset, self._state_key, self._action_key)
         dataset = self._cached_dataset
         slim_hf_dataset = self._cached_slim_hf
 
-        if getattr(self, "_rng", None) is None:
-            # See LeRobotV3TransitionIterableDataset.__iter__'s identical fix
-            # for why this must be created once and persisted, not recreated
-            # fresh every epoch.
-            self._rng = np.random.default_rng(self.seed + worker_id)
-        rng = self._rng
-        episode_order = np.arange(self.num_episodes)
-        if self.shuffle_episodes:
-            rng.shuffle(episode_order)
-        episode_order = episode_order[worker_id::num_workers]
-
-        for ep_i in episode_order:
-            frm, to = self.episode_ranges[int(ep_i)]
-            ep_rewards = self._rewards_by_episode[int(ep_i)]
-            # qc_label_rewards.py caches embeddings/candidates for the same
-            # n=len(ep_rewards) frames as rewards (obs_t of each of the n
-            # valid transitions) -- one short of all (to-frm) frames in the
-            # episode (the very last frame's embedding is never cached). A
-            # chunk starting at local index i needs embed[i] and
-            # embed[i+horizon_length] (+ candidates[i+horizon_length] for the
-            # TD target) all valid, i.e. i in [0, n_valid).
-            n_valid = len(ep_rewards) - self.horizon_length
-            if n_valid <= 0:
-                continue
-            local_indices = np.arange(n_valid)
-            if self.shuffle_episodes:
-                rng.shuffle(local_indices)
-            ep_embeds = self._embeds_by_episode[int(ep_i)]
-            ep_candidates = self._candidates_by_episode[int(ep_i)]
-            for local_idx in local_indices:
-                global_idx = frm + int(local_idx)
-                yield self._get_chunk(
-                    dataset, slim_hf_dataset, global_idx, int(local_idx), ep_rewards, ep_embeds, ep_candidates
-                )
+        ep_i, local_idx = self.index[flat_idx]
+        frm, _ = self.episode_ranges[ep_i]
+        global_idx = frm + local_idx
+        ep_rewards = self._rewards_by_episode[ep_i]
+        ep_embeds = self._embeds_by_episode[ep_i]
+        ep_candidates = self._candidates_by_episode[ep_i]
+        return self._get_chunk(dataset, slim_hf_dataset, global_idx, local_idx, ep_rewards, ep_embeds, ep_candidates)
 
     def _get_chunk(
         self,
@@ -791,9 +796,13 @@ class QChunkDataLoader:
         self.data_sharding = data_sharding
         dataset = QChunkTransitionDataset(
             config, repo_id_or_root, horizon_length, qc_cache_path, discount=discount,
-            is_local_root=is_local_root, shuffle_episodes=True, seed=seed,
+            is_local_root=is_local_root,
             alpha_intrinsic=alpha_intrinsic, alpha_goal=alpha_goal,
         )
+        # See JepaTransitionDataLoader's identical shuffle=True + persisted
+        # generator note.
+        generator = torch.Generator()
+        generator.manual_seed(seed)
         self._torch_loader = TorchDataLoader(
             dataset,
             batch_size=batch_size,
@@ -801,6 +810,8 @@ class QChunkDataLoader:
             collate_fn=_collate_qchunk,
             drop_last=True,
             persistent_workers=num_workers > 0,
+            shuffle=True,
+            generator=generator,
         )
         self._queue: "queue.Queue" = queue.Queue(maxsize=prefetch)
         self._stop = threading.Event()

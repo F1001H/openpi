@@ -36,7 +36,7 @@ import numpy as np
 
 import openpi.training.config as _config
 from data_loader import (
-    LeRobotV3TransitionIterableDataset,
+    LeRobotV3TransitionDataset,
     _collate,
     raw_batch_to_transition,
 )
@@ -77,8 +77,8 @@ def main():
 
     print(f"Loading metadata ({'local root' if is_local_root else 'hub repo'}: {repo_id_or_root}) ...")
     t0 = time.time()
-    dataset = LeRobotV3TransitionIterableDataset(
-        config, repo_id_or_root, config.model.action_horizon, is_local_root=is_local_root, seed=0
+    dataset = LeRobotV3TransitionDataset(
+        config, repo_id_or_root, config.model.action_horizon, is_local_root=is_local_root
     )
     print(f"  metadata + transform pipeline built in {time.time() - t0:.1f}s")
 

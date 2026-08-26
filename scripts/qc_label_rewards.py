@@ -59,7 +59,7 @@ import openpi.training.utils as training_utils
 
 from jepa.train_step_transitions import compute_intrinsic_reward
 from utils.data_loader import (
-    LeRobotV3TransitionIterableDataset,
+    LeRobotV3TransitionDataset,
     _collate,
     raw_batch_to_transition,
     resolve_dataset_root,
@@ -69,35 +69,25 @@ from train_end_to_end import init_logging, init_train_state
 
 
 class _FlatTransitionDataset(torch_data.Dataset):
-    """Map-style wrapper around LeRobotV3TransitionIterableDataset's
-    per-sample _get_transition, flattened across all episodes into one
-    stable global index -- lets a standard multi-worker DataLoader
-    parallelize video decoding across processes. A naive sequential,
-    single-process loop over this dataset's ~80k frames (2 timesteps x N
-    cameras of decode each) was projected at ~11 hours; this is the fix.
-    Each item carries (ep_i, local_idx) so results can be scattered into the
-    right cache slot regardless of the (num_workers>1-induced) arrival order.
-    """
+    """Thin wrapper adding (ep_i, local_idx) metadata to LeRobotV3Transition
+    Dataset's own __getitem__ output, so labeling results can be scattered
+    into the right cache slot regardless of (num_workers>1-induced) arrival
+    order -- LeRobotV3TransitionDataset itself is already flat/map-style
+    (its own index built once at construction, parallelizing video decoding
+    across a standard multi-worker DataLoader; a naive sequential,
+    single-process loop over this dataset's ~80k frames was projected at
+    ~11 hours), this just exposes the (episode, position) bookkeeping the
+    labeling loop needs that plain training doesn't."""
 
-    def __init__(self, ds: LeRobotV3TransitionIterableDataset):
+    def __init__(self, ds: LeRobotV3TransitionDataset):
         self.ds = ds
-        self.index: list[tuple[int, int, int]] = []  # (ep_i, local_idx, global_idx)
-        for ep_i, (frm, to) in enumerate(ds.episode_ranges):
-            for local_idx in range(to - frm - 1):
-                self.index.append((ep_i, local_idx, frm + local_idx))
 
     def __len__(self) -> int:
-        return len(self.index)
+        return len(self.ds)
 
     def __getitem__(self, flat_idx: int) -> dict:
-        # Lazily built per-worker-process, same reasoning as
-        # LeRobotV3TransitionIterableDataset.__iter__'s _cached_dataset --
-        # the heavy video-decoder-backed LeRobotDataset shouldn't cross a
-        # process fork.
-        if getattr(self, "_cached_dataset", None) is None:
-            self._cached_dataset = self.ds._build_dataset()
-        ep_i, local_idx, global_idx = self.index[flat_idx]
-        raw = self.ds._get_transition(self._cached_dataset, global_idx)
+        raw = self.ds[flat_idx]
+        ep_i, local_idx, _ = self.ds.index[flat_idx]
         raw["_ep_i"] = ep_i
         raw["_local_idx"] = local_idx
         return raw
@@ -194,9 +184,9 @@ def label_rewards(
 
     data_config = config.data.create(config.assets_dirs, config.model)
     repo_id_or_root, is_local_root = resolve_dataset_root(data_config)
-    ds = LeRobotV3TransitionIterableDataset(
+    ds = LeRobotV3TransitionDataset(
         config, repo_id_or_root, config.model.action_horizon,
-        is_local_root=is_local_root, shuffle_episodes=False,
+        is_local_root=is_local_root,
     )
     logging.info(f"{ds.num_episodes} episodes, {ds.total_frames} frames in {repo_id_or_root}")
 

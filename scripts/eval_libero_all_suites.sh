@@ -23,6 +23,13 @@ NUM_TRIALS="${2:-20}"
 NAME="${3:-$(basename "$(dirname "$CKPT_DIR")")_$(basename "$CKPT_DIR")}"
 CONFIG_NAME="${CONFIG_NAME:-pi05_libero}"   # full fine-tune's config, NOT pi05_libero_low_mem -- override if evaluating a LoRA checkpoint instead
 PORT="${PORT:-8000}"
+# 3600s (the old hardcoded value) was sized for NUM_TRIALS=20 (200 episodes/
+# suite) -- confirmed too tight at NUM_TRIALS=50 (500 episodes/suite): a real
+# libero_10 50-trial run hit it at 484/500 episodes (83.5% success, matching
+# the already-known 20-trial number closely -- a timeout, not a crash).
+# 7200s covers 500 episodes with real margin at libero_10's observed
+# ~7.4s/episode plain-BC pace; override for even larger NUM_TRIALS.
+SUITE_TIMEOUT="${SUITE_TIMEOUT:-7200}"
 
 if [ ! -d "$CKPT_DIR/params" ]; then
     echo "ERROR: $CKPT_DIR has no params/ subdir -- point this at a single extracted checkpoint step." >&2
@@ -74,7 +81,7 @@ for suite in "${SUITES[@]}"; do
     set +e
     (
         source "$LIBERO_VENV/bin/activate"
-        MUJOCO_GL=egl timeout 3600 python examples/libero/main.py \
+        MUJOCO_GL=egl timeout "$SUITE_TIMEOUT" python examples/libero/main.py \
             --args.port "$PORT" \
             --args.task-suite-name "$suite" --args.num-trials-per-task "$NUM_TRIALS" \
             --args.video-out-path "$video_dir"

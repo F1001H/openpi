@@ -43,6 +43,10 @@ ALPHA_BC="${ALPHA_BC:-1.0}"
 BETA_JEPA="${BETA_JEPA:-0.0}"             # the only real difference from train_pi05_libero_full_finetune.slurm
 EXP_NAME="${EXP_NAME:-libero_jepa_full_finetune_beta${BETA_JEPA}}"
 FSDP_DEVICES="${FSDP_DEVICES:-4}"
+SEED="${SEED:-42}"                        # TrainConfig's own default -- override for an independent training-run
+                                          # variance check (different data-shuffling/init draw), e.g. to see
+                                          # whether beta0.0_v2's libero_10 gap to reference is this-run-specific
+                                          # or reproduces across training seeds too.
 
 cd "$REPO_DIR"
 mkdir -p slurm/logs "$CHECKPOINT_BASE_DIR" "$WANDB_DIR" "$(dirname "$JEPA_NPZ_CKPT")"
@@ -72,6 +76,7 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train_end_to_end.py \
     "$CONFIG_NAME" \
     --exp-name="$EXP_NAME" \
     --resume \
+    --seed="$SEED" \
     --data.root="$DATASET_ROOT" \
     --checkpoint-base-dir="$CHECKPOINT_BASE_DIR" \
     --fsdp-devices="$FSDP_DEVICES" \
